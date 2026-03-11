@@ -73,6 +73,7 @@ type DownloadJob struct {
 	MaxGoroutines int
 	HostType      string
 	MovieName     string
+	OutputName    string
 	Cookie        string
 	AutoClear     bool
 	Insecure      int
@@ -130,6 +131,7 @@ func Run() {
 		MaxGoroutines: *nFlag,
 		HostType:      *htFlag,
 		MovieName:     *oFlag,
+		OutputName:    *oFlag + ".mp4",
 		AutoClear:     *rFlag,
 		Cookie:        *cFlag,
 		Insecure:      *sFlag,
@@ -154,9 +156,25 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	if job.HostType == "" {
 		job.HostType = "v1"
 	}
+	if job.MovieName == "" && job.OutputName != "" {
+		job.MovieName = strings.TrimSuffix(job.OutputName, filepath.Ext(job.OutputName))
+	}
 	if job.MovieName == "" {
 		job.MovieName = "movie"
 	}
+	if job.OutputName == "" {
+		job.OutputName = job.MovieName + ".mp4"
+	}
+	pwd, _ := os.Getwd()
+	if job.SavePath != "" {
+		pwd = job.SavePath
+	}
+	outputPath := filepath.Join(pwd, job.OutputName)
+	tmpDir := filepath.Join(pwd, job.MovieName+".parts")
+	if isExist, _ := pathExists(tmpDir); !isExist {
+		_ = os.MkdirAll(tmpDir, os.ModePerm)
+	}
+
 	ro := ro
 	ro.Headers = cloneHeaders(ro.Headers)
 	ro.Headers["Referer"] = getHost(job.M3U8URL, "v2")
@@ -166,14 +184,6 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	if job.Cookie != "" {
 		ro.Headers["Cookie"] = job.Cookie
 	}
-	pwd, _ := os.Getwd()
-	if job.SavePath != "" {
-		pwd = job.SavePath
-	}
-	downloadDir := filepath.Join(pwd, job.MovieName)
-	if isExist, _ := pathExists(downloadDir); !isExist {
-		os.MkdirAll(downloadDir, os.ModePerm)
-	}
 
 	m3u8Host := getHost(job.M3U8URL, job.HostType)
 	m3u8Body := getM3u8Body(job.M3U8URL, &ro)
@@ -182,18 +192,24 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 		fmt.Printf("待解密 ts 文件 key : %s \n", tsKey)
 	}
 	tsList := getTsList(m3u8Host, m3u8Body)
+	if len(tsList) == 0 {
+		return "", fmt.Errorf("m3u8中未解析到ts分片")
+	}
 	fmt.Println("待下载 ts 文件数量:", len(tsList))
 	if onProgress != nil {
 		onProgress(0, len(tsList))
 	}
 
-	downloader(tsList, job.MaxGoroutines, downloadDir, tsKey, &ro, onProgress)
-	if ok := checkTsDownDir(downloadDir); !ok {
-		return "", fmt.Errorf("请检查url地址有效性")
+	okCount := downloader(tsList, job.MaxGoroutines, tmpDir, tsKey, &ro, onProgress)
+	if okCount != len(tsList) {
+		return "", fmt.Errorf("ts下载不完整: %d/%d", okCount, len(tsList))
 	}
-	mv := mergeTs(downloadDir)
+	mv, err := mergeTs(tmpDir, outputPath, tsList)
+	if err != nil {
+		return "", err
+	}
 	if job.AutoClear {
-		os.RemoveAll(downloadDir)
+		_ = os.RemoveAll(tmpDir)
 	}
 	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", mv, time.Now().Sub(now).Seconds())
 	return mv, nil
@@ -353,7 +369,7 @@ func (m *DownloadManager) rpcAddURI(params []json.RawMessage) (interface{}, *RPC
 	}
 	gid := newGID()
 	m.mu.Lock()
-	m.tasks[gid] = &TaskStatus{GID: gid, Status: "waiting", Result: "", Error: ""}
+	m.tasks[gid] = &TaskStatus{GID: gid, Status: "waiting", Result: expectedOutputPath(job), Error: ""}
 	m.mu.Unlock()
 	go m.runTask(gid, job)
 	return gid, nil
@@ -521,6 +537,7 @@ func toAria2Status(task *TaskStatus) map[string]interface{} {
 
 func applyJobOptions(job *DownloadJob, options map[string]interface{}) {
 	if out, ok := options["out"].(string); ok && out != "" {
+		job.OutputName = out
 		job.MovieName = strings.TrimSuffix(out, filepath.Ext(out))
 	}
 	if dir, ok := options["dir"].(string); ok {
@@ -537,6 +554,22 @@ func applyJobOptions(job *DownloadJob, options map[string]interface{}) {
 			job.MaxGoroutines = n
 		}
 	}
+}
+
+func expectedOutputPath(job DownloadJob) string {
+	pwd, _ := os.Getwd()
+	if job.SavePath != "" {
+		pwd = job.SavePath
+	}
+	out := job.OutputName
+	if out == "" {
+		name := job.MovieName
+		if name == "" {
+			name = "movie"
+		}
+		out = name + ".mp4"
+	}
+	return filepath.Join(pwd, out)
 }
 
 func newGID() string {
@@ -681,13 +714,13 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *greque
 }
 
 // downloader m3u8 下载器
-func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key string, ro *grequests.RequestOptions, onProgress ProgressFunc) {
+func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key string, ro *grequests.RequestOptions, onProgress ProgressFunc) int {
 	retry := 5 //单个ts 下载重试次数
 	var wg sync.WaitGroup
 	limiter := make(chan struct{}, maxGoroutines) //chan struct 内存占用 0 bool 占用 1
 	tsLen := len(tsList)
 	if tsLen == 0 {
-		return
+		return 0
 	}
 	var downloadCount int64
 	for _, ts := range tsList {
@@ -705,39 +738,34 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 					onProgress(int(count), tsLen)
 				}
 			}
-			return
 		}(ts, downloadDir, key, retry)
 	}
 	wg.Wait()
-}
-
-func checkTsDownDir(dir string) bool {
-	if isExist, _ := pathExists(filepath.Join(dir, fmt.Sprintf(TS_NAME_TEMPLATE, 0))); !isExist {
-		return true
-	}
-	return false
+	return int(downloadCount)
 }
 
 // 合并ts文件
-func mergeTs(downloadDir string) string {
-	mvName := downloadDir + ".mp4"
-	outMv, _ := os.Create(mvName)
+func mergeTs(downloadDir, outputPath string, tsList []TsInfo) (string, error) {
+	outMv, err := os.Create(outputPath)
+	if err != nil {
+		return "", err
+	}
 	defer outMv.Close()
 	writer := bufio.NewWriter(outMv)
-	err := filepath.Walk(downloadDir, func(path string, f os.FileInfo, err error) error {
-		if f == nil {
-			return err
+	for _, ts := range tsList {
+		path := filepath.Join(downloadDir, ts.Name)
+		bytes, err := ioutil.ReadFile(path)
+		if err != nil {
+			return "", err
 		}
-		if f.IsDir() || filepath.Ext(path) != ".ts" {
-			return nil
+		if _, err = writer.Write(bytes); err != nil {
+			return "", err
 		}
-		bytes, _ := ioutil.ReadFile(path)
-		_, err = writer.Write(bytes)
-		return err
-	})
-	checkErr(err)
-	_ = writer.Flush()
-	return mvName
+	}
+	if err = writer.Flush(); err != nil {
+		return "", err
+	}
+	return outputPath, nil
 }
 
 // 进度条
