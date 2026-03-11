@@ -30,6 +30,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 - s  InsecureSkipVerify:是否允许不安全的请求(默认0)
 - sp savePath:文件保存的绝对路径(默认为当前路径,建议默认值)(例如：unix:/Users/xxxx ; windows:C:\Documents)
 - api-listen apiListen:aria2风格JSON-RPC地址(例如 :6800)
+- rpc-secret rpcSecret:aria2 rpc鉴权密钥(API模式必填)
 - j  jobNum:并行下载任务数(默认1, 仅API模式生效)
 ```
 
@@ -64,7 +65,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 启动 API 服务：
 
 ```bash
-./m3u8-downloader -api-listen=:6800 -j=2
+./m3u8-downloader -api-listen=:6800 -rpc-secret=aword2020 -j=2
 ```
 
 提交下载任务（`aria2.addUri`）：
@@ -72,7 +73,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 ```bash
 curl -s http://127.0.0.1:6800/jsonrpc \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"q1","method":"aria2.addUri","params":[["http://example.com/index.m3u8"],{"out":"movie.mp4","dir":"/tmp","split":"16"}]}'
+  -d '{"jsonrpc":"2.0","id":"q1","method":"aria2.addUri","params":["token:aword2020",["http://example.com/index.m3u8"],{"out":"movie.mp4","dir":"/tmp","split":"16"}]}'
 ```
 
 查询任务状态（`aria2.tellStatus`）：
@@ -80,12 +81,12 @@ curl -s http://127.0.0.1:6800/jsonrpc \
 ```bash
 curl -s http://127.0.0.1:6800/jsonrpc \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"q2","method":"aria2.tellStatus","params":["<gid>"]}'
+  -d '{"jsonrpc":"2.0","id":"q2","method":"aria2.tellStatus","params":["token:aword2020","<gid>"]}'
 ```
 
 返回状态包含：`waiting`、`active`、`complete`、`error`。
 
-兼容性增强：已补齐 AriaNg 常用查询接口（如 `aria2.getVersion`、`aria2.getGlobalStat`、`aria2.tellActive`、`aria2.tellWaiting`、`aria2.tellStopped`、`system.multicall`），并同时支持 `/jsonrpc` 与 `/rpc` 路径，便于直接对接 ariang 面板。
+兼容性增强：已补齐 AriaNg 常用查询接口（如 `aria2.getVersion`、`aria2.getGlobalStat`、`aria2.tellActive`、`aria2.tellWaiting`、`aria2.tellStopped`、`system.multicall`），并同时支持 `/jsonrpc` 与 `/rpc` 路径，支持 `HTTP`/`WebSocket`（`ws://host:port/jsonrpc`）协议；同时要求使用 `token:<rpc-secret>` 鉴权，便于直接对接 ariang 面板。
 
 ### 二进制方式:
 

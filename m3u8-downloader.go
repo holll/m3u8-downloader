@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/levigross/grequests"
+	"golang.org/x/net/websocket"
 )
 
 const (
@@ -41,16 +42,17 @@ const (
 
 var (
 	// 命令行参数
-	urlFlag = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
-	nFlag   = flag.Int("n", 24, "num:下载线程数(默认24)")
-	jFlag   = flag.Int("j", 1, "jobNum:并行下载任务数(默认1, 仅API模式生效)")
-	htFlag  = flag.String("ht", "v1", "hostType:设置getHost的方式(v1: `http(s):// + url.Host + filepath.Dir(url.Path)`; v2: `http(s)://+ u.Host`")
-	oFlag   = flag.String("o", "movie", "movieName:自定义文件名(默认为movie)不带后缀")
-	cFlag   = flag.String("c", "", "cookie:自定义请求cookie")
-	rFlag   = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
-	sFlag   = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求(默认0)")
-	spFlag  = flag.String("sp", "", "savePath:文件保存的绝对路径(默认为当前路径,建议默认值)")
-	apiFlag = flag.String("api-listen", "", "apiListen:aria2风格JSON-RPC地址(例如 :6800)")
+	urlFlag       = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
+	nFlag         = flag.Int("n", 24, "num:下载线程数(默认24)")
+	jFlag         = flag.Int("j", 1, "jobNum:并行下载任务数(默认1, 仅API模式生效)")
+	htFlag        = flag.String("ht", "v1", "hostType:设置getHost的方式(v1: `http(s):// + url.Host + filepath.Dir(url.Path)`; v2: `http(s)://+ u.Host`")
+	oFlag         = flag.String("o", "movie", "movieName:自定义文件名(默认为movie)不带后缀")
+	cFlag         = flag.String("c", "", "cookie:自定义请求cookie")
+	rFlag         = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
+	sFlag         = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求(默认0)")
+	spFlag        = flag.String("sp", "", "savePath:文件保存的绝对路径(默认为当前路径,建议默认值)")
+	apiFlag       = flag.String("api-listen", "", "apiListen:aria2风格JSON-RPC地址(例如 :6800)")
+	rpcSecretFlag = flag.String("rpc-secret", "", "rpcSecret:aria2 rpc鉴权密钥(API模式必填)")
 
 	logger *log.Logger
 	ro     = grequests.RequestOptions{
@@ -84,9 +86,10 @@ type TaskStatus struct {
 }
 
 type DownloadManager struct {
-	limiter chan struct{}
-	mu      sync.RWMutex
-	tasks   map[string]*TaskStatus
+	limiter   chan struct{}
+	mu        sync.RWMutex
+	tasks     map[string]*TaskStatus
+	rpcSecret string
 }
 
 // TsInfo 用于保存 ts 文件的下载地址和文件名
@@ -110,7 +113,11 @@ func Run() {
 
 	flag.Parse()
 	if *apiFlag != "" {
-		runAPIServer(*apiFlag, *jFlag)
+		if *rpcSecretFlag == "" {
+			fmt.Println("[Failed] API模式下必须设置 -rpc-secret")
+			return
+		}
+		runAPIServer(*apiFlag, *jFlag, *rpcSecretFlag)
 		return
 	}
 	job := DownloadJob{
@@ -192,11 +199,15 @@ func cloneHeaders(src map[string]string) map[string]string {
 	return dst
 }
 
-func runAPIServer(addr string, maxJobs int) {
+func runAPIServer(addr string, maxJobs int, rpcSecret string) {
 	if maxJobs <= 0 {
 		maxJobs = 1
 	}
-	manager := &DownloadManager{limiter: make(chan struct{}, maxJobs), tasks: map[string]*TaskStatus{}}
+	manager := &DownloadManager{
+		limiter:   make(chan struct{}, maxJobs),
+		tasks:     map[string]*TaskStatus{},
+		rpcSecret: rpcSecret,
+	}
 	http.HandleFunc("/jsonrpc", manager.handleJSONRPC)
 	http.HandleFunc("/rpc", manager.handleJSONRPC)
 	fmt.Printf("[API] json-rpc listening on %s, max parallel jobs: %d\n", addr, maxJobs)
@@ -204,31 +215,87 @@ func runAPIServer(addr string, maxJobs int) {
 }
 
 func (m *DownloadManager) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
+	if isWebSocketRequest(r) {
+		websocket.Handler(m.handleJSONRPCWebSocket).ServeHTTP(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeJSONRPCError(w, nil, -32700, "invalid body")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": nil, "error": map[string]interface{}{"code": -32700, "message": "invalid body"}}))
 		return
 	}
+	resp := m.processRPCBody(body)
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(resp)
+}
+
+func (m *DownloadManager) handleJSONRPCWebSocket(conn *websocket.Conn) {
+	defer conn.Close()
+	for {
+		var message []byte
+		if err := websocket.Message.Receive(conn, &message); err != nil {
+			return
+		}
+		resp := m.processRPCBody(message)
+		if err := websocket.Message.Send(conn, string(resp)); err != nil {
+			return
+		}
+	}
+}
+
+func isWebSocketRequest(r *http.Request) bool {
+	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
+	connection := strings.ToLower(r.Header.Get("Connection"))
+	return upgrade == "websocket" && strings.Contains(connection, "upgrade")
+}
+
+func (m *DownloadManager) processRPCBody(body []byte) []byte {
 	var req struct {
 		JSONRPC string            `json:"jsonrpc"`
 		ID      interface{}       `json:"id"`
 		Method  string            `json:"method"`
 		Params  []json.RawMessage `json:"params"`
 	}
-	if err = json.Unmarshal(body, &req); err != nil {
-		writeJSONRPCError(w, nil, -32700, "parse error")
-		return
+	if err := json.Unmarshal(body, &req); err != nil {
+		return marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": nil, "error": map[string]interface{}{"code": -32700, "message": "parse error"}})
 	}
-	result, rpcErr := m.dispatch(req.Method, req.Params)
+	params, rpcErr := m.authorize(req.Method, req.Params)
 	if rpcErr != nil {
-		writeJSONRPCError(w, req.ID, rpcErr.Code, rpcErr.Message)
-		return
+		return marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "error": map[string]interface{}{"code": rpcErr.Code, "message": rpcErr.Message}})
 	}
-	writeJSONRPCResult(w, req.ID, result)
+	result, rpcErr := m.dispatch(req.Method, params)
+	if rpcErr != nil {
+		return marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "error": map[string]interface{}{"code": rpcErr.Code, "message": rpcErr.Message}})
+	}
+	return marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": result})
+}
+
+func (m *DownloadManager) authorize(method string, params []json.RawMessage) ([]json.RawMessage, *RPCError) {
+	if m.rpcSecret == "" {
+		return params, nil
+	}
+	if len(params) == 0 {
+		return nil, &RPCError{Code: 1, Message: "Unauthorized"}
+	}
+	var token string
+	if err := json.Unmarshal(params[0], &token); err == nil && token == "token:"+m.rpcSecret {
+		return params[1:], nil
+	}
+	return nil, &RPCError{Code: 1, Message: "Unauthorized"}
+}
+
+func marshalRPCResponse(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		fallback := []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}`)
+		return fallback
+	}
+	return b
 }
 
 type RPCError struct {
@@ -447,16 +514,6 @@ func applyJobOptions(job *DownloadJob, options map[string]interface{}) {
 			job.MaxGoroutines = n
 		}
 	}
-}
-
-func writeJSONRPCResult(w http.ResponseWriter, id interface{}, result interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": result})
-}
-
-func writeJSONRPCError(w http.ResponseWriter, id interface{}, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": id, "error": map[string]interface{}{"code": code, "message": msg}})
 }
 
 func newGID() string {

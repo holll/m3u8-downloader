@@ -2,4 +2,7 @@ module m3u8-downloader
 
 go 1.16
 
-require github.com/levigross/grequests v0.0.0-20190908174114-253788527a1a
+require (
+	github.com/levigross/grequests v0.0.0-20190908174114-253788527a1a
+	golang.org/x/net v0.0.0-20181011144130-49bb7cea24b1
+)
