@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/levigross/grequests"
@@ -79,10 +80,12 @@ type DownloadJob struct {
 }
 
 type TaskStatus struct {
-	GID    string `json:"gid"`
-	Status string `json:"status"`
-	Result string `json:"result,omitempty"`
-	Error  string `json:"error,omitempty"`
+	GID               string `json:"gid"`
+	Status            string `json:"status"`
+	Result            string `json:"result,omitempty"`
+	Error             string `json:"error,omitempty"`
+	TotalSegments     int    `json:"totalSegments,omitempty"`
+	CompletedSegments int    `json:"completedSegments,omitempty"`
 }
 
 type DownloadManager struct {
@@ -97,6 +100,8 @@ type TsInfo struct {
 	Name string
 	Url  string
 }
+
+type ProgressFunc func(done, total int)
 
 func init() {
 	logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
@@ -130,7 +135,7 @@ func Run() {
 		Insecure:      *sFlag,
 		SavePath:      *spFlag,
 	}
-	mv, err := runDownload(job)
+	mv, err := runDownload(job, nil)
 	if err != nil {
 		fmt.Printf("\n[Failed] %v\n", err)
 		return
@@ -138,7 +143,7 @@ func Run() {
 	DrawProgressBar("Merging", float32(1), PROGRESS_WIDTH, mv)
 }
 
-func runDownload(job DownloadJob) (string, error) {
+func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	now := time.Now()
 	if !strings.HasPrefix(job.M3U8URL, "http") || job.M3U8URL == "" {
 		return "", fmt.Errorf("invalid m3u8 url")
@@ -178,8 +183,11 @@ func runDownload(job DownloadJob) (string, error) {
 	}
 	tsList := getTsList(m3u8Host, m3u8Body)
 	fmt.Println("待下载 ts 文件数量:", len(tsList))
+	if onProgress != nil {
+		onProgress(0, len(tsList))
+	}
 
-	downloader(tsList, job.MaxGoroutines, downloadDir, tsKey, &ro)
+	downloader(tsList, job.MaxGoroutines, downloadDir, tsKey, &ro, onProgress)
 	if ok := checkTsDownDir(downloadDir); !ok {
 		return "", fmt.Errorf("请检查url地址有效性")
 	}
@@ -446,7 +454,9 @@ func (m *DownloadManager) rpcMultiCall(params []json.RawMessage) (interface{}, *
 func (m *DownloadManager) runTask(gid string, job DownloadJob) {
 	m.limiter <- struct{}{}
 	m.updateTask(gid, "active", "", "")
-	result, err := runDownload(job)
+	result, err := runDownload(job, func(done, total int) {
+		m.updateTaskProgress(gid, done, total)
+	})
 	if err != nil {
 		m.updateTask(gid, "error", "", err.Error())
 		<-m.limiter
@@ -463,6 +473,19 @@ func (m *DownloadManager) updateTask(gid, status, result, errMsg string) {
 		task.Status = status
 		task.Result = result
 		task.Error = errMsg
+	}
+}
+
+func (m *DownloadManager) updateTaskProgress(gid string, done, total int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if task, ok := m.tasks[gid]; ok {
+		if total >= 0 {
+			task.TotalSegments = total
+		}
+		if done >= 0 {
+			task.CompletedSegments = done
+		}
 	}
 }
 
@@ -485,8 +508,8 @@ func toAria2Status(task *TaskStatus) map[string]interface{} {
 	return map[string]interface{}{
 		"gid":             task.GID,
 		"status":          status,
-		"totalLength":     "0",
-		"completedLength": "0",
+		"totalLength":     strconv.Itoa(task.TotalSegments),
+		"completedLength": strconv.Itoa(task.CompletedSegments),
 		"downloadSpeed":   "0",
 		"errorCode":       errorCode,
 		"errorMessage":    task.Error,
@@ -602,29 +625,22 @@ func getFromFile() string {
 
 // 下载ts文件
 // @modify: 2020-08-13 修复ts格式SyncByte合并不能播放问题
-func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *grequests.RequestOptions) {
+func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *grequests.RequestOptions) bool {
 	if retries <= 0 {
-		return
+		return false
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			//fmt.Println("网络不稳定，正在进行断点持续下载")
-			downloadTsFile(ts, download_dir, key, retries-1, ro)
-		}
-	}()
 	curr_path_file := fmt.Sprintf("%s/%s", download_dir, ts.Name)
 	if isExist, _ := pathExists(curr_path_file); isExist {
 		//logger.Println("[warn] File: " + ts.Name + "already exist")
-		return
+		return true
 	}
 	res, err := grequests.Get(ts.Url, ro)
 	if err != nil || !res.Ok {
 		if retries > 0 {
-			downloadTsFile(ts, download_dir, key, retries-1, ro)
-			return
+			return downloadTsFile(ts, download_dir, key, retries-1, ro)
 		} else {
 			//logger.Printf("[warn] File :%s", ts.Url)
-			return
+			return false
 		}
 	}
 	// 校验长度是否合法
@@ -637,16 +653,14 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *greque
 	}
 	if len(origData) == 0 || (contentLen > 0 && len(origData) < contentLen) || res.Error != nil {
 		//logger.Println("[warn] File: " + ts.Name + "res origData invalid or err：", res.Error)
-		downloadTsFile(ts, download_dir, key, retries-1, ro)
-		return
+		return downloadTsFile(ts, download_dir, key, retries-1, ro)
 	}
 	// 解密出视频 ts 源文件
 	if key != "" {
 		//解密 ts 文件，算法：aes 128 cbc pack5
 		origData, err = AesDecrypt(origData, []byte(key))
 		if err != nil {
-			downloadTsFile(ts, download_dir, key, retries-1, ro)
-			return
+			return downloadTsFile(ts, download_dir, key, retries-1, ro)
 		}
 	}
 	// https://en.wikipedia.org/wiki/MPEG_transport_stream
@@ -660,16 +674,22 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *greque
 			break
 		}
 	}
-	ioutil.WriteFile(curr_path_file, origData, 0666)
+	if err := ioutil.WriteFile(curr_path_file, origData, 0666); err != nil {
+		return false
+	}
+	return true
 }
 
 // downloader m3u8 下载器
-func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key string, ro *grequests.RequestOptions) {
+func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key string, ro *grequests.RequestOptions, onProgress ProgressFunc) {
 	retry := 5 //单个ts 下载重试次数
 	var wg sync.WaitGroup
 	limiter := make(chan struct{}, maxGoroutines) //chan struct 内存占用 0 bool 占用 1
 	tsLen := len(tsList)
-	downloadCount := 0
+	if tsLen == 0 {
+		return
+	}
+	var downloadCount int64
 	for _, ts := range tsList {
 		wg.Add(1)
 		limiter <- struct{}{}
@@ -678,9 +698,13 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 				wg.Done()
 				<-limiter
 			}()
-			downloadTsFile(ts, downloadDir, key, retryies, ro)
-			downloadCount++
-			DrawProgressBar("Downloading", float32(downloadCount)/float32(tsLen), PROGRESS_WIDTH, ts.Name)
+			if downloadTsFile(ts, downloadDir, key, retryies, ro) {
+				count := atomic.AddInt64(&downloadCount, 1)
+				DrawProgressBar("Downloading", float32(count)/float32(tsLen), PROGRESS_WIDTH, ts.Name)
+				if onProgress != nil {
+					onProgress(int(count), tsLen)
+				}
+			}
 			return
 		}(ts, downloadDir, key, retry)
 	}
