@@ -8,6 +8,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 1. 下载和解析 M3U8
 2. 下载 TS 失败重试 （加密的同步解密)
 3. 合并 TS 片段
+4. 提供 aria2 风格 JSON-RPC API（支持并行任务数控制）
 
 > 可以下载岛国小电影  
 > 可以下载岛国小电影  
@@ -28,6 +29,8 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 - r  autoClear:是否自动清除ts文件 (default true)
 - s  InsecureSkipVerify:是否允许不安全的请求(默认0)
 - sp savePath:文件保存的绝对路径(默认为当前路径,建议默认值)(例如：unix:/Users/xxxx ; windows:C:\Documents)
+- api-listen apiListen:aria2风格JSON-RPC地址(例如 :6800)
+- j  jobNum:并行下载任务数(默认1, 仅API模式生效)
 ```
 
 默认情况只需要传`u`参数,其他参数保持默认即可。 部分链接可能限制请求频率，可根据实际情况调整 `n` 参数的值。
@@ -54,6 +57,35 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 简洁使用：./m3u8-downloader  -u=http://example.com/index.m3u8
 完整使用：./m3u8-downloader  -u=http://example.com/index.m3u8 -o=example -n=16 -ht=v1 -c="key1=v1; key2=v2"
 ```
+
+
+### API 模式（aria2 风格）
+
+启动 API 服务：
+
+```bash
+./m3u8-downloader -api-listen=:6800 -j=2
+```
+
+提交下载任务（`aria2.addUri`）：
+
+```bash
+curl -s http://127.0.0.1:6800/jsonrpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"q1","method":"aria2.addUri","params":[["http://example.com/index.m3u8"],{"out":"movie.mp4","dir":"/tmp","split":"16"}]}'
+```
+
+查询任务状态（`aria2.tellStatus`）：
+
+```bash
+curl -s http://127.0.0.1:6800/jsonrpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"q2","method":"aria2.tellStatus","params":["<gid>"]}'
+```
+
+返回状态包含：`waiting`、`active`、`complete`、`error`。
+
+兼容性增强：已补齐 AriaNg 常用查询接口（如 `aria2.getVersion`、`aria2.getGlobalStat`、`aria2.tellActive`、`aria2.tellWaiting`、`aria2.tellStopped`、`system.multicall`），并同时支持 `/jsonrpc` 与 `/rpc` 路径，便于直接对接 ariang 面板。
 
 ### 二进制方式:
 
