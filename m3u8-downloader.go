@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha1"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -170,7 +171,7 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 		pwd = job.SavePath
 	}
 	outputPath := filepath.Join(pwd, job.OutputName)
-	tmpDir := filepath.Join(pwd, job.MovieName+".parts")
+	tmpDir := buildPartsDir(pwd, job.M3U8URL)
 	if isExist, _ := pathExists(tmpDir); !isExist {
 		_ = os.MkdirAll(tmpDir, os.ModePerm)
 	}
@@ -213,6 +214,11 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	}
 	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", mv, time.Now().Sub(now).Seconds())
 	return mv, nil
+}
+
+func buildPartsDir(basePath, m3u8URL string) string {
+	sum := sha1.Sum([]byte(strings.TrimSpace(m3u8URL)))
+	return filepath.Join(basePath, fmt.Sprintf("%x.parts", sum[:8]))
 }
 
 func cloneHeaders(src map[string]string) map[string]string {
@@ -664,8 +670,10 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *greque
 	}
 	curr_path_file := fmt.Sprintf("%s/%s", download_dir, ts.Name)
 	if isExist, _ := pathExists(curr_path_file); isExist {
-		//logger.Println("[warn] File: " + ts.Name + "already exist")
-		return true
+		if info, err := os.Stat(curr_path_file); err == nil && info.Size() > 0 {
+			return true
+		}
+		_ = os.Remove(curr_path_file)
 	}
 	res, err := grequests.Get(ts.Url, ro)
 	if err != nil || !res.Ok {
