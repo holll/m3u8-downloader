@@ -32,6 +32,8 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 - api-listen apiListen:aria2风格JSON-RPC地址(例如 :6800)
 - rpc-secret rpcSecret:aria2 rpc鉴权密钥(API模式必填)
 - j  jobNum:并行下载任务数(默认1, 仅API模式生效)
+- debug 启用调试模式，输出更详细日志到文件 (default false)
+- debug-log debug日志文件路径 (default "./m3u8-downloader.debug.log")
 ```
 
 默认情况只需要传`u`参数,其他参数保持默认即可。 部分链接可能限制请求频率，可根据实际情况调整 `n` 参数的值。
@@ -57,6 +59,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 自己编译：go build -o m3u8-downloader
 简洁使用：./m3u8-downloader  -u=http://example.com/index.m3u8
 完整使用：./m3u8-downloader  -u=http://example.com/index.m3u8 -o=example -n=16 -ht=v1 -c="key1=v1; key2=v2"
+调试模式：./m3u8-downloader -u=http://example.com/index.m3u8 -debug -debug-log=./debug.log
 ```
 
 

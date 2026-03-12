@@ -18,6 +18,11 @@ func Run() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	flag.Parse()
+	if err := initDebugLogging(); err != nil {
+		fmt.Printf("[Failed] 初始化debug日志失败: %v\n", err)
+		return
+	}
+	debugf("flags parsed: api-listen=%s, n=%d, j=%d", *apiFlag, *nFlag, *jFlag)
 	if *apiFlag != "" {
 		if *rpcSecretFlag == "" {
 			fmt.Println("[Failed] API模式下必须设置 -rpc-secret")
@@ -46,6 +51,7 @@ func Run() {
 }
 
 // runDownload 负责执行单任务下载。
+// 核心步骤：参数归一化 -> 请求参数准备 -> m3u8解析 -> 分片下载 -> 顺序合并。
 func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	now := time.Now()
 	if !strings.HasPrefix(job.M3U8URL, "http") || job.M3U8URL == "" {
@@ -87,6 +93,7 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	}
 
 	m3u8Host := getHost(job.M3U8URL, job.HostType)
+	debugf("resolved host=%s for url=%s", m3u8Host, job.M3U8URL)
 	m3u8Body := getM3u8Body(job.M3U8URL, &ro)
 	tsKey := getM3u8Key(m3u8Host, m3u8Body, &ro)
 	if tsKey != "" {
@@ -104,6 +111,7 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	tsRO := ro
 	tsRO.RequestTimeout = TS_TIMEOUT
 	okCount := downloader(tsList, job.MaxGoroutines, tmpDir, tsKey, &tsRO, onProgress)
+	debugf("download finished: success=%d total=%d partsDir=%s", okCount, len(tsList), tmpDir)
 	if okCount != len(tsList) {
 		return "", fmt.Errorf("ts下载不完整: %d/%d", okCount, len(tsList))
 	}

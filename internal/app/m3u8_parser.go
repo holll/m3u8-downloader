@@ -11,6 +11,7 @@ import (
 )
 
 // m3u8 解析相关函数。
+// 该模块负责 host 解析、密钥抓取和 ts 列表展开。
 func getHost(Url, ht string) (host string) {
 	u, err := url.Parse(Url)
 	checkErr(err)
@@ -37,7 +38,7 @@ func getM3u8Key(host, html string, ro *grequests.RequestOptions) (key string) {
 			if !strings.Contains(line, "URI") {
 				continue
 			}
-			fmt.Println("[debug] line_key:", line)
+			debugf("m3u8 key line: %s", line)
 			uri_pos := strings.Index(line, "URI")
 			quotation_mark_pos := strings.LastIndex(line, "\"")
 			key_url := strings.Split(line[uri_pos:quotation_mark_pos], "\"")[1]
@@ -52,10 +53,11 @@ func getM3u8Key(host, html string, ro *grequests.RequestOptions) (key string) {
 			}
 		}
 	}
-	fmt.Println("[debug] m3u8Host:", host, "m3u8Key:", key)
+	debugf("m3u8 key resolved: host=%s keyLen=%d", host, len(key))
 	return
 }
 
+// getTsList 将 m3u8 文本转换为顺序分片列表，后续下载与合并都依赖该顺序。
 func getTsList(host, body string) (tsList []TsInfo) {
 	lines := strings.Split(body, "\n")
 	index := 0

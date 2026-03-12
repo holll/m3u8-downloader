@@ -15,7 +15,8 @@ import (
 	"golang.org/x/net/websocket"
 )
 
-// API 与 RPC 方法分发。
+// runAPIServer 启动 aria2 风格 JSON-RPC 服务。
+// 支持 HTTP POST + WebSocket，两条路径 /jsonrpc 和 /rpc 共用一套处理。
 func runAPIServer(addr string, maxJobs int, rpcSecret string) {
 	if maxJobs <= 0 {
 		maxJobs = 1
@@ -46,6 +47,7 @@ func (m *DownloadManager) handleJSONRPC(w http.ResponseWriter, r *http.Request) 
 		_, _ = w.Write(marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": nil, "error": map[string]interface{}{"code": -32700, "message": "invalid body"}}))
 		return
 	}
+	debugf("http rpc request: path=%s remote=%s", r.URL.Path, r.RemoteAddr)
 	resp := m.processRPCBody(body)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(resp)
@@ -71,6 +73,7 @@ func isWebSocketRequest(r *http.Request) bool {
 	return upgrade == "websocket" && strings.Contains(connection, "upgrade")
 }
 
+// processRPCBody 执行统一的 JSON-RPC 流程：解析 -> 鉴权 -> 方法分发 -> 响应封装。
 func (m *DownloadManager) processRPCBody(body []byte) []byte {
 	var req struct {
 		JSONRPC string            `json:"jsonrpc"`
@@ -85,6 +88,7 @@ func (m *DownloadManager) processRPCBody(body []byte) []byte {
 	if rpcErr != nil {
 		return marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "error": map[string]interface{}{"code": rpcErr.Code, "message": rpcErr.Message}})
 	}
+	debugf("rpc dispatch: method=%s params=%d", req.Method, len(params))
 	result, rpcErr := m.dispatch(req.Method, params)
 	if rpcErr != nil {
 		return marshalRPCResponse(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "error": map[string]interface{}{"code": rpcErr.Code, "message": rpcErr.Message}})
@@ -97,10 +101,12 @@ func (m *DownloadManager) authorize(method string, params []json.RawMessage) ([]
 		return params, nil
 	}
 	if len(params) == 0 {
+		debugf("rpc auth failed: method=%s", method)
 		return nil, &RPCError{Code: 1, Message: "Unauthorized"}
 	}
 	var token string
 	if err := json.Unmarshal(params[0], &token); err == nil && token == "token:"+m.rpcSecret {
+		debugf("rpc auth passed: method=%s", method)
 		return params[1:], nil
 	}
 	return nil, &RPCError{Code: 1, Message: "Unauthorized"}
@@ -263,6 +269,7 @@ func (m *DownloadManager) rpcMultiCall(params []json.RawMessage) (interface{}, *
 func (m *DownloadManager) runTask(gid string, job DownloadJob) {
 	m.limiter <- struct{}{}
 	m.updateTask(gid, "active", "", "")
+	debugf("task active: gid=%s url=%s", gid, job.M3U8URL)
 	result, err := runDownload(job, func(done, total int) {
 		m.updateTaskProgress(gid, done, total)
 	})
@@ -272,6 +279,7 @@ func (m *DownloadManager) runTask(gid string, job DownloadJob) {
 		return
 	}
 	m.updateTask(gid, "complete", result, "")
+	debugf("task complete: gid=%s result=%s", gid, result)
 	<-m.limiter
 }
 

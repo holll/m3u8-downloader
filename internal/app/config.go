@@ -2,6 +2,7 @@ package app
 
 import (
 	"flag"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -35,6 +36,8 @@ var (
 	spFlag        = flag.String("sp", "", "savePath:文件保存的绝对路径(默认为当前路径,建议默认值)")
 	apiFlag       = flag.String("api-listen", "", "apiListen:aria2风格JSON-RPC地址(例如 :6800)")
 	rpcSecretFlag = flag.String("rpc-secret", "", "rpcSecret:aria2 rpc鉴权密钥(API模式必填)")
+	debugFlag     = flag.Bool("debug", false, "debug:启用调试模式并输出详细日志")
+	debugLogFlag  = flag.String("debug-log", "./m3u8-downloader.debug.log", "debugLog:调试日志文件路径")
 
 	logger *log.Logger
 	ro     = grequests.RequestOptions{
@@ -86,6 +89,27 @@ type TsInfo struct {
 
 type ProgressFunc func(done, total int)
 
+// init 初始化默认日志输出（stdout）；debug 模式会在 Run 中进一步改写。
 func init() {
 	logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lshortfile)
+}
+
+// initDebugLogging 在 debug 模式下把日志同时输出到终端和文件。
+func initDebugLogging() error {
+	if !*debugFlag {
+		return nil
+	}
+	f, err := os.OpenFile(*debugLogFlag, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	logger.SetOutput(io.MultiWriter(os.Stdout, f))
+	logger.Printf("[debug] debug mode enabled, log file: %s", *debugLogFlag)
+	return nil
+}
+
+func debugf(format string, args ...interface{}) {
+	if *debugFlag {
+		logger.Printf("[debug] "+format, args...)
+	}
 }

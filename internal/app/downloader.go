@@ -16,8 +16,10 @@ import (
 )
 
 // 分片下载、合并与进度展示。
+// downloadTsFile 的策略是：存在且非空即复用；失败自动递归重试。
 func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *grequests.RequestOptions) bool {
 	if retries <= 0 {
+		debugf("segment retries exhausted: name=%s url=%s", ts.Name, ts.Url)
 		return false
 	}
 	curr_path_file := fmt.Sprintf("%s/%s", download_dir, ts.Name)
@@ -28,6 +30,7 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *greque
 		_ = os.Remove(curr_path_file)
 	}
 	res, err := grequests.Get(ts.Url, ro)
+	debugf("segment fetch: name=%s status_ok=%v err=%v", ts.Name, err == nil && res != nil && res.Ok, err)
 	if err != nil || !res.Ok {
 		if retries > 0 {
 			return downloadTsFile(ts, download_dir, key, retries-1, ro)
@@ -117,6 +120,7 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 		}
 		wg.Wait()
 		if len(failed) > 0 && round < maxRounds {
+			debugf("round=%d failed=%d concurrency=%d", round, len(failed), concurrency)
 			fmt.Printf("\n[warn] 第%d轮失败分片: %d，准备重试...\n", round, len(failed))
 			time.Sleep(time.Duration(round) * 500 * time.Millisecond)
 		}
@@ -125,6 +129,7 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 	return int(downloadCount)
 }
 
+// mergeTs 按 tsList 原始顺序拼接，避免文件系统遍历顺序导致的视频错乱。
 func mergeTs(downloadDir, outputPath string, tsList []TsInfo) (string, error) {
 	outMv, err := os.Create(outputPath)
 	if err != nil {
