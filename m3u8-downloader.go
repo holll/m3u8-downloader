@@ -36,6 +36,8 @@ import (
 const (
 	// HEAD_TIMEOUT 请求头超时时间
 	HEAD_TIMEOUT = 5 * time.Second
+	// TS_TIMEOUT ts分片下载超时时间
+	TS_TIMEOUT = 20 * time.Second
 	// PROGRESS_WIDTH 进度条长度
 	PROGRESS_WIDTH = 20
 	// TS_NAME_TEMPLATE ts视频片段命名规则
@@ -201,7 +203,9 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 		onProgress(0, len(tsList))
 	}
 
-	okCount := downloader(tsList, job.MaxGoroutines, tmpDir, tsKey, &ro, onProgress)
+	tsRO := ro
+	tsRO.RequestTimeout = TS_TIMEOUT
+	okCount := downloader(tsList, job.MaxGoroutines, tmpDir, tsKey, &tsRO, onProgress)
 	if okCount != len(tsList) {
 		return "", fmt.Errorf("ts下载不完整: %d/%d", okCount, len(tsList))
 	}
@@ -634,7 +638,8 @@ func getTsList(host, body string) (tsList []TsInfo) {
 	lines := strings.Split(body, "\n")
 	index := 0
 	var ts TsInfo
-	for _, line := range lines {
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
 		if !strings.HasPrefix(line, "#") && line != "" {
 			//有可能出现的二级嵌套格式的m3u8,请自行转换！
 			index++
@@ -724,31 +729,53 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *greque
 // downloader m3u8 下载器
 func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key string, ro *grequests.RequestOptions, onProgress ProgressFunc) int {
 	retry := 5 //单个ts 下载重试次数
-	var wg sync.WaitGroup
-	limiter := make(chan struct{}, maxGoroutines) //chan struct 内存占用 0 bool 占用 1
 	tsLen := len(tsList)
 	if tsLen == 0 {
 		return 0
 	}
-	var downloadCount int64
-	for _, ts := range tsList {
-		wg.Add(1)
-		limiter <- struct{}{}
-		go func(ts TsInfo, downloadDir, key string, retryies int) {
-			defer func() {
-				wg.Done()
-				<-limiter
-			}()
-			if downloadTsFile(ts, downloadDir, key, retryies, ro) {
-				count := atomic.AddInt64(&downloadCount, 1)
-				DrawProgressBar("Downloading", float32(count)/float32(tsLen), PROGRESS_WIDTH, ts.Name)
-				if onProgress != nil {
-					onProgress(int(count), tsLen)
-				}
-			}
-		}(ts, downloadDir, key, retry)
+	if maxGoroutines <= 0 {
+		maxGoroutines = 1
 	}
-	wg.Wait()
+	var downloadCount int64
+	pending := tsList
+	maxRounds := 3
+	for round := 1; round <= maxRounds && len(pending) > 0; round++ {
+		failed := make([]TsInfo, 0)
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		concurrency := maxGoroutines / round
+		if concurrency <= 0 {
+			concurrency = 1
+		}
+		limiter := make(chan struct{}, concurrency)
+		for _, ts := range pending {
+			wg.Add(1)
+			limiter <- struct{}{}
+			go func(ts TsInfo) {
+				defer func() {
+					wg.Done()
+					<-limiter
+				}()
+				if downloadTsFile(ts, downloadDir, key, retry, ro) {
+					count := atomic.AddInt64(&downloadCount, 1)
+					DrawProgressBar("Downloading", float32(count)/float32(tsLen), PROGRESS_WIDTH, ts.Name)
+					if onProgress != nil {
+						onProgress(int(count), tsLen)
+					}
+					return
+				}
+				mu.Lock()
+				failed = append(failed, ts)
+				mu.Unlock()
+			}(ts)
+		}
+		wg.Wait()
+		if len(failed) > 0 && round < maxRounds {
+			fmt.Printf("\n[warn] 第%d轮失败分片: %d，准备重试...\n", round, len(failed))
+			time.Sleep(time.Duration(round) * 500 * time.Millisecond)
+		}
+		pending = failed
+	}
 	return int(downloadCount)
 }
 
