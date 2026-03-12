@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -21,6 +22,8 @@ const (
 	PROGRESS_WIDTH = 20
 	// TS_NAME_TEMPLATE ts视频片段命名规则
 	TS_NAME_TEMPLATE = "%05d.ts"
+	// DEBUG_LOG_FILENAME debug 模式固定日志文件名（位于主程序同目录）
+	DEBUG_LOG_FILENAME = "m3u8-downloader.debug.log"
 )
 
 var (
@@ -37,7 +40,6 @@ var (
 	apiFlag       = flag.String("api-listen", "", "apiListen:aria2风格JSON-RPC地址(例如 :6800)")
 	rpcSecretFlag = flag.String("rpc-secret", "", "rpcSecret:aria2 rpc鉴权密钥(API模式必填)")
 	debugFlag     = flag.Bool("debug", false, "debug:启用调试模式并输出详细日志")
-	debugLogFlag  = flag.String("debug-log", "./m3u8-downloader.debug.log", "debugLog:调试日志文件路径")
 
 	logger *log.Logger
 	ro     = grequests.RequestOptions{
@@ -95,16 +97,22 @@ func init() {
 }
 
 // initDebugLogging 在 debug 模式下把日志同时输出到终端和文件。
+// 日志文件固定在主程序同目录：<executable_dir>/m3u8-downloader.debug.log。
 func initDebugLogging() error {
 	if !*debugFlag {
 		return nil
 	}
-	f, err := os.OpenFile(*debugLogFlag, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	logPath := filepath.Join(filepath.Dir(exePath), DEBUG_LOG_FILENAME)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	logger.SetOutput(io.MultiWriter(os.Stdout, f))
-	logger.Printf("[debug] debug mode enabled, log file: %s", *debugLogFlag)
+	logger.Printf("[debug] debug mode enabled, log file: %s", logPath)
 	return nil
 }
 
