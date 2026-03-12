@@ -2,7 +2,6 @@ package app
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -84,9 +83,4 @@ func getTsList(host, body string) (tsList []TsInfo) {
 		}
 	}
 	return
-}
-
-func getFromFile() string {
-	data, _ := ioutil.ReadFile("./ts.txt")
-	return string(data)
 }

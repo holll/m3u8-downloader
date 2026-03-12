@@ -3,7 +3,6 @@ package app
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -70,7 +69,7 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int, ro *greque
 			break
 		}
 	}
-	if err := ioutil.WriteFile(curr_path_file, origData, 0666); err != nil {
+	if err := os.WriteFile(curr_path_file, origData, 0666); err != nil {
 		return false
 	}
 	return true
@@ -139,7 +138,7 @@ func mergeTs(downloadDir, outputPath string, tsList []TsInfo) (string, error) {
 	writer := bufio.NewWriter(outMv)
 	for _, ts := range tsList {
 		path := filepath.Join(downloadDir, ts.Name)
-		bytes, err := ioutil.ReadFile(path)
+		bytes, err := os.ReadFile(path)
 		if err != nil {
 			return "", err
 		}

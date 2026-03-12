@@ -23,7 +23,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 ```
 - u  m3u8下载地址(http(s)://url/xx/xx/index.m3u8)
 - o  movieName:自定义文件名(默认为movie)不带后缀 (default "movie")
-- n  num:下载线程数(默认24)
+- n  num:下载线程数(默认1)
 - ht hostType:设置getHost的方式(v1: http(s):// + url.Host + filepath.Dir(url.Path); v2: `http(s)://+ u.Host` (default "v1")
 - c  cookie:自定义请求cookie (例如：key1=v1; key2=v2)
 - r  autoClear:是否自动清除ts文件 (default true)
