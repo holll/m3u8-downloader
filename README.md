@@ -29,6 +29,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 - r  autoClear:是否自动清除ts文件 (default true)
 - s  InsecureSkipVerify:是否允许不安全的请求(默认0)
 - sp savePath:文件保存的绝对路径(默认为当前路径,建议默认值)(例如：unix:/Users/xxxx ; windows:C:\Documents)
+- proxy proxy:下载代理地址(例如：http://127.0.0.1:7890)
 - api-listen apiListen:aria2风格JSON-RPC地址(例如 :6800)
 - rpc-secret rpcSecret:aria2 rpc鉴权密钥(API模式必填)
 - j  jobNum:并行下载任务数(默认1, 仅API模式生效)
@@ -58,6 +59,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 自己编译：go build -o m3u8-downloader
 简洁使用：./m3u8-downloader  -u=http://example.com/index.m3u8
 完整使用：./m3u8-downloader  -u=http://example.com/index.m3u8 -o=example -n=16 -ht=v1 -c="key1=v1; key2=v2"
+代理下载：./m3u8-downloader -u=http://example.com/index.m3u8 -proxy=http://127.0.0.1:7890
 调试模式：./m3u8-downloader -u=http://example.com/index.m3u8 -debug  # 日志固定输出到程序同目录 m3u8-downloader.debug.log
 ```
 
@@ -75,7 +77,7 @@ golang 多线程下载直播流m3u8格式的视屏，跨平台。 你只需指�
 ```bash
 curl -s http://127.0.0.1:6800/jsonrpc \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"q1","method":"aria2.addUri","params":["token:aword2020",["http://example.com/index.m3u8"],{"out":"movie.mp4","dir":"/tmp","split":"16"}]}'
+  -d '{"jsonrpc":"2.0","id":"q1","method":"aria2.addUri","params":["token:aword2020",["http://example.com/index.m3u8"],{"out":"movie.mp4","dir":"/tmp","split":"16","all-proxy":"http://127.0.0.1:7890"}]}'
 ```
 
 查询任务状态（`aria2.tellStatus`）：

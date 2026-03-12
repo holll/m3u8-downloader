@@ -4,11 +4,14 @@ import (
 	"crypto/sha1"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/levigross/grequests"
 )
 
 // Run 是程序主流程入口：解析参数后进入 CLI 或 API 模式。
@@ -41,6 +44,7 @@ func Run() {
 		Cookie:        *cFlag,
 		Insecure:      *sFlag,
 		SavePath:      *spFlag,
+		Proxy:         *proxyFlag,
 	}
 	mv, err := runDownload(job, nil)
 	if err != nil {
@@ -91,6 +95,9 @@ func runDownload(job DownloadJob, onProgress ProgressFunc) (string, error) {
 	if job.Cookie != "" {
 		ro.Headers["Cookie"] = job.Cookie
 	}
+	if err := applyProxy(&ro, job.Proxy); err != nil {
+		return "", err
+	}
 
 	m3u8Host := getHost(job.M3U8URL, job.HostType)
 	debugf("resolved host=%s for url=%s", m3u8Host, job.M3U8URL)
@@ -138,4 +145,21 @@ func cloneHeaders(src map[string]string) map[string]string {
 		dst[k] = v
 	}
 	return dst
+}
+
+func applyProxy(ro *grequests.RequestOptions, proxyAddr string) error {
+	proxyAddr = strings.TrimSpace(proxyAddr)
+	if proxyAddr == "" {
+		return nil
+	}
+	u, err := url.Parse(proxyAddr)
+	if err != nil {
+		return fmt.Errorf("invalid proxy url: %w", err)
+	}
+	ro.Proxies = map[string]*url.URL{
+		"http":  u,
+		"https": u,
+	}
+	debugf("proxy enabled: %s", u.String())
+	return nil
 }

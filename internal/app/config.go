@@ -37,6 +37,7 @@ var (
 	rFlag         = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
 	sFlag         = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求(默认0)")
 	spFlag        = flag.String("sp", "", "savePath:文件保存的绝对路径(默认为当前路径,建议默认值)")
+	proxyFlag     = flag.String("proxy", "", "proxy:下载代理地址(例如 http://127.0.0.1:7890)")
 	apiFlag       = flag.String("api-listen", "", "apiListen:aria2风格JSON-RPC地址(例如 :6800)")
 	rpcSecretFlag = flag.String("rpc-secret", "", "rpcSecret:aria2 rpc鉴权密钥(API模式必填)")
 	debugFlag     = flag.Bool("debug", false, "debug:启用调试模式并输出详细日志")
@@ -65,6 +66,7 @@ type DownloadJob struct {
 	AutoClear     bool
 	Insecure      int
 	SavePath      string
+	Proxy         string
 }
 
 type TaskStatus struct {

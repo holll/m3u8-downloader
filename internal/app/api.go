@@ -159,7 +159,7 @@ func (m *DownloadManager) rpcAddURI(params []json.RawMessage) (interface{}, *RPC
 	if err := json.Unmarshal(params[0], &uris); err != nil || len(uris) == 0 {
 		return nil, &RPCError{Code: -32602, Message: "invalid uri list"}
 	}
-	job := DownloadJob{M3U8URL: uris[0], MaxGoroutines: *nFlag, HostType: *htFlag, MovieName: *oFlag, AutoClear: *rFlag, Cookie: *cFlag, Insecure: *sFlag, SavePath: *spFlag}
+	job := DownloadJob{M3U8URL: uris[0], MaxGoroutines: *nFlag, HostType: *htFlag, MovieName: *oFlag, AutoClear: *rFlag, Cookie: *cFlag, Insecure: *sFlag, SavePath: *spFlag, Proxy: *proxyFlag}
 	if len(params) > 1 {
 		var opts map[string]interface{}
 		if err := json.Unmarshal(params[1], &opts); err == nil {
@@ -343,6 +343,15 @@ func applyJobOptions(job *DownloadJob, options map[string]interface{}) {
 	}
 	if dir, ok := options["dir"].(string); ok {
 		job.SavePath = dir
+	}
+	if proxy, ok := options["proxy"].(string); ok {
+		job.Proxy = proxy
+	}
+	if proxy, ok := options["http-proxy"].(string); ok {
+		job.Proxy = proxy
+	}
+	if proxy, ok := options["all-proxy"].(string); ok {
+		job.Proxy = proxy
 	}
 	if header, ok := options["header"].(string); ok {
 		job.Cookie = header
