@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,6 +117,7 @@ func (t *Task) setSegmentTotal(n int64) {
 func (t *Task) setError(code, msg string) {
 	t.errorCode = code
 	t.errorMessage = msg
+	log.Printf("[task %s] error: %s", t.GID, msg)
 	t.setStatus(StatusError)
 	t.finishedAt = now()
 	close(t.doneCh)
@@ -234,6 +236,7 @@ func (t *Task) Start(onDone func()) {
 		// 清理临时目录
 		os.RemoveAll(dlDir)
 
+		log.Printf("[task %s] complete: %s/%s.mp4", t.GID, outDir, t.out)
 		t.setStatus(StatusComplete)
 		t.finishedAt = now()
 	}()

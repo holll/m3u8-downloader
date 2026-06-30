@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"m3u8-downloader/task"
 )
@@ -19,10 +21,11 @@ import (
 
 // Server JSON-RPC 2.0 HTTP 服务
 type Server struct {
-	manager *task.Manager
-	secret  string
-	addr    string
-	hs      *http.Server
+	manager  *task.Manager
+	secret   string
+	addr     string
+	hs       *http.Server
+	reqCount int64 // atomic request counter
 }
 
 // NewServer 创建服务实例
@@ -58,6 +61,8 @@ func (s *Server) Stop() error {
 // ============================== HTTP Handler ==============================
 
 func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
+	_ = atomic.AddInt64(&s.reqCount, 1)
+
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("[RPC] panic: %v", rec)
@@ -67,10 +72,7 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 
 	// WebSocket 升级检测
 	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		if s.secret != "" && !s.authenticate(r) {
-			writeError(w, nil, &RPCError{Code: 1, Message: "Unauthorized"})
-			return
-		}
+		// WebSocket token 在首条消息的 params[0] 中校验（由 stripToken 处理）
 		s.handleWebSocket(w, r)
 		return
 	}
@@ -188,6 +190,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// 消息循环
 	buf := make([]byte, 1<<20)
+	authed := s.secret == "" // 无 secret 则跳过认证
 
 	for {
 		// 读取 WebSocket 帧
@@ -202,28 +205,62 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// 仅处理文本帧
 		if op != 1 { // text frame
 			if op == 8 { // close frame
+				log.Printf("[RPC-ws] client closed")
 				return
 			}
 			if op == 9 { // ping → pong
 				writeWSFrame(conn, msg, 10) // pong
 				continue
 			}
+			log.Printf("[RPC-ws] ignoring opcode=%d len=%d", op, len(msg))
 			continue
 		}
 
-		// 解析 JSON-RPC
-		var req Request
-		if err := json.Unmarshal(msg, &req); err != nil {
-			log.Printf("[RPC-ws] json: %v", err)
-			continue
+		// WebSocket 层认证：首条消息必须包含有效 token
+		if !authed {
+			if tok := extractToken(msg); tok == "token:"+s.secret || tok == s.secret {
+				authed = true
+			} else {
+				log.Printf("[RPC-ws] auth failed, closing")
+				writeWSFrame(conn, []byte(`{"jsonrpc":"2.0","error":{"code":1,"message":"Unauthorized"},"id":null}`), 1)
+				return
+			}
 		}
-		req.Params = stripToken(req.Params)
 
-		resp := s.dispatch(req)
-		respBytes, _ := json.Marshal(resp)
-		if err := writeWSFrame(conn, respBytes, 1); err != nil {
-			log.Printf("[RPC-ws] write: %v", err)
-			return
+		// 解析 JSON-RPC（支持单条和批量）
+		msg = bytes.TrimLeft(msg, " \t\r\n")
+		if len(msg) > 0 && msg[0] == '[' {
+			// 批量请求
+			var reqs []Request
+			if err := json.Unmarshal(msg, &reqs); err != nil {
+				log.Printf("[RPC-ws] batch json: %v", err)
+				continue
+			}
+			responses := make([]Response, 0, len(reqs))
+			for _, req := range reqs {
+				req.Params = stripToken(req.Params)
+				responses = append(responses, s.dispatch(req))
+			}
+			respBytes, _ := json.Marshal(responses)
+			if err := writeWSFrame(conn, respBytes, 1); err != nil {
+				log.Printf("[RPC-ws] write: %v", err)
+				return
+			}
+		} else {
+			// 单条请求
+			var req Request
+			if err := json.Unmarshal(msg, &req); err != nil {
+				log.Printf("[RPC-ws] json: %v", err)
+				continue
+			}
+			req.Params = stripToken(req.Params)
+
+			resp := s.dispatch(req)
+			respBytes, _ := json.Marshal(resp)
+			if err := writeWSFrame(conn, respBytes, 1); err != nil {
+				log.Printf("[RPC-ws] write: %v", err)
+				return
+			}
 		}
 	}
 }
@@ -312,17 +349,21 @@ func (s *Server) authenticate(r *http.Request) bool {
 
 // authenticateBody 从 JSON body 的 params[0] 提取 token
 func (s *Server) authenticateBody(body []byte) bool {
+	tok := extractToken(body)
+	return tok == "token:"+s.secret || tok == s.secret
+}
+
+// extractToken 从 JSON-RPC 消息的 params[0] 提取 token 字符串
+func extractToken(body []byte) string {
 	var req struct {
 		Params []json.RawMessage `json:"params"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Params) == 0 {
-		return false
+		return ""
 	}
 	var tok string
-	if err := json.Unmarshal(req.Params[0], &tok); err != nil {
-		return false
-	}
-	return tok == "token:"+s.secret || tok == s.secret
+	json.Unmarshal(req.Params[0], &tok)
+	return tok
 }
 
 // ============================== 请求处理 ==============================
@@ -414,7 +455,13 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Upgrade, Connection")
+
+		// 回显浏览器请求的 headers（兼容所有 AriaNg 版本）
+		if reqH := r.Header.Get("Access-Control-Request-Headers"); reqH != "" {
+			w.Header().Set("Access-Control-Allow-Headers", reqH)
+		} else {
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)

@@ -28,6 +28,13 @@ func init() {
 		"aria2.getVersion":           handleGetVersion,
 		"aria2.getSessionInfo":       handleGetSessionInfo,
 		"system.multicall":           handleMulticall,
+		"aria2.getGlobalOption":      handleGetGlobalOption,
+		"aria2.changeGlobalOption":   handleChangeGlobalOption,
+		"aria2.shutdown":             handleShutdown,
+		"aria2.forceRemove":          handleRemove,
+		"aria2.forcePause":           handlePause,
+		"aria2.pauseAll":             handlePauseAll,
+		"aria2.unpauseAll":           handleUnpauseAll,
 	}
 }
 
@@ -217,4 +224,31 @@ func handleMulticall(params json.RawMessage, mgr *task.Manager) (interface{}, er
 		results = append(results, newResponse(parseID(req.ID), result))
 	}
 	return results, nil
+}
+
+// ============================== 补充方法 (stub) ==============================
+
+func handleGetGlobalOption(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	return map[string]string{
+		"max-concurrent-downloads":   "1",
+		"max-connection-per-server":  "3",
+		"max-overall-download-limit": "0",
+		"dir":                        ".",
+	}, nil
+}
+
+func handleChangeGlobalOption(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	return "OK", nil
+}
+
+func handleShutdown(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	return "OK", nil
+}
+
+func handlePauseAll(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	return "OK", nil
+}
+
+func handleUnpauseAll(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	return "OK", nil
 }
