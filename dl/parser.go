@@ -54,8 +54,9 @@ func (d *Downloader) parseWithLib() error {
 			continue
 		}
 		s := Segment{
-			Index:    i,
-			Duration: seg.Duration,
+			Index:           i,
+			Duration:        seg.Duration,
+			ProgramDateTime: seg.ProgramDateTime,
 		}
 		s.URL = d.resolveURL(seg.URI)
 

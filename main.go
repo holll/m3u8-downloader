@@ -68,6 +68,7 @@ func Run() {
 		MaxWorkers: *nFlag,
 		HostType:   *htFlag,
 		AutoClear:  *rFlag,
+		AutoName:   *oFlag == "movie",
 		Cookie:     *cFlag,
 		Insecure:   *sFlag != 0,
 	})
@@ -77,6 +78,10 @@ func Run() {
 		fmt.Printf("\n[Failed] 解析 m3u8 失败: %v\n", err)
 		return
 	}
+
+	// 3.1、自动识别文件名（默认 -o 未指定时，从流元数据提取时间戳）
+	d.AutoName(pwd)
+
 	fmt.Printf("待下载切片数量: %d", d.SegmentCount())
 	if d.IsFmp4() {
 		fmt.Print(" (fMP4 格式)")

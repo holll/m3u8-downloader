@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ============================== 导出常量 ==============================
@@ -33,11 +34,12 @@ type MapInfo struct {
 
 // Segment 单个切片信息
 type Segment struct {
-	URL      string
-	Key      *KeyInfo
-	Map      *MapInfo
-	Index    int
-	Duration float64
+	URL             string
+	Key             *KeyInfo
+	Map             *MapInfo
+	Index           int
+	Duration        float64
+	ProgramDateTime time.Time // EXT-X-PROGRAM-DATE-TIME (用于自动识别文件名)
 }
 
 // ProgressTracker 线程安全的进度跟踪器

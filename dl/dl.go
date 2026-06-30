@@ -3,6 +3,7 @@ package dl
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"m3u8-downloader/util"
@@ -24,6 +25,7 @@ type Config struct {
 	MaxWorkers int
 	HostType   string
 	AutoClear  bool
+	AutoName   bool
 	Cookie     string
 	Insecure   bool
 }
@@ -42,6 +44,7 @@ type Downloader struct {
 	outputFile  string
 	maxWorkers  int
 	autoClear   bool
+	autoName    bool
 	hostType    string
 	reqOpts     *grequests.RequestOptions
 	progress    *ProgressTracker
@@ -56,6 +59,7 @@ func New(cfg Config) *Downloader {
 		maxWorkers: cfg.MaxWorkers,
 		hostType:   cfg.HostType,
 		autoClear:  cfg.AutoClear,
+		autoName:   cfg.AutoName,
 	}
 	d.initRequestOptions(cfg.Cookie, cfg.Insecure)
 	return d
@@ -80,6 +84,24 @@ func (d *Downloader) AutoClear() bool { return d.autoClear }
 
 // OutputDir 返回临时下载目录
 func (d *Downloader) OutputDir() string { return d.outputDir }
+
+// AutoName 从流的 PROGRAM-DATE-TIME 元数据自动生成输出文件名。
+// baseDir 是最终输出文件所在的目录（通常为当前工作目录）。
+// 仅在 autoName 为 true 且解析到了有效时间戳时生效。
+func (d *Downloader) AutoName(baseDir string) {
+	if !d.autoName {
+		return
+	}
+	for _, seg := range d.segments {
+		if !seg.ProgramDateTime.IsZero() {
+			name := seg.ProgramDateTime.Format("20060102_150405")
+			d.outputFile = filepath.Join(baseDir, name+".mp4")
+			Log.Printf("[info] 自动识别文件名: %s.mp4", name)
+			return
+		}
+	}
+	Log.Println("[info] 未检测到 PROGRAM-DATE-TIME，使用默认文件名")
+}
 
 // --- 请求初始化 ---
 
