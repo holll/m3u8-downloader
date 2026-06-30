@@ -1,13 +1,14 @@
 // @author:llychao<lychao_vip@163.com>
 // @contributor: Junyi<me@junyi.pw>
 // @date:2020-02-18
-// @功能:golang m3u8 video Downloader
-// @fix:2026-06-30 — fMP4 support, concurrency fixes, proper IV handling, package split
+// @功能:golang m3u8 video Downloader (CLI + aria2 RPC)
+// @fix:2026-06-30 — fMP4 support, concurrency fixes, proper IV handling, aria2 RPC server
 package main
 
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,20 +16,29 @@ import (
 	"time"
 
 	"m3u8-downloader/dl"
+	"m3u8-downloader/rpc"
+	"m3u8-downloader/task"
 	"m3u8-downloader/util"
 )
 
 // ============================== 命令行参数 ==============================
 
 var (
+	// CLI 模式
 	urlFlag = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
-	nFlag   = flag.Int("n", 24, "num:下载线程数(默认24)")
-	htFlag  = flag.String("ht", "v1", "hostType:设置getHost的方式(v1: http(s):// + url.Host + filepath.Dir(url.Path); v2: http(s)://+ u.Host")
-	oFlag   = flag.String("o", "movie", "movieName:自定义文件名(默认为movie)不带后缀")
+	nFlag   = flag.Int("n", 3, "num:下载线程数(默认3)")
+	htFlag  = flag.String("ht", "v1", "hostType: v1/v2")
+	oFlag   = flag.String("o", "movie", "movieName:自定义文件名(默认为movie)")
 	cFlag   = flag.String("c", "", "cookie:自定义请求cookie")
 	rFlag   = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
-	sFlag   = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求(默认0)")
-	spFlag  = flag.String("sp", "", "savePath:文件保存的绝对路径(默认为当前路径,建议默认值)")
+	sFlag   = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求")
+	spFlag  = flag.String("sp", "", "savePath:文件保存的绝对路径")
+
+	// RPC Server 模式
+	rpcPort     = flag.Int("rpc-listen-port", 0, "RPC监听端口(0=CLI模式, 非0=Server模式)")
+	rpcSecret   = flag.String("rpc-secret", "", "RPC鉴权token(空=无鉴权)")
+	rpcListen   = flag.Bool("rpc-listen-all", false, "监听所有网卡(默认仅localhost)")
+	maxDownload = flag.Int("max-concurrent-downloads", 1, "最大同时下载数(Server模式, 默认1)")
 )
 
 func main() {
@@ -37,19 +47,28 @@ func main() {
 
 // Run 主流程
 func Run() {
+	flag.Parse()
+
+	if *rpcPort != 0 {
+		runServer()
+	} else {
+		runCLI()
+	}
+}
+
+// ============================== CLI 模式 ==============================
+
+func runCLI() {
 	fmt.Println("[功能]:多线程下载直播流m3u8视屏（支持 TS/fMP4）\n[提醒]:下载失败，请使用 -ht=v2\n[提醒]:fMP4 流需要 ffmpeg 进行合并\n[提醒]:进度条中途下载失败，可重复执行断点续传")
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	now := time.Now()
 
-	// 1、解析命令行参数
-	flag.Parse()
 	m3u8Url := *urlFlag
 	if !strings.HasPrefix(m3u8Url, "http") || m3u8Url == "" {
 		flag.Usage()
 		return
 	}
 
-	// 2、创建下载器
 	pwd, _ := os.Getwd()
 	if *spFlag != "" {
 		pwd = *spFlag
@@ -73,13 +92,10 @@ func Run() {
 		Insecure:   *sFlag != 0,
 	})
 
-	// 3、解析 m3u8
 	if err := d.Parse(); err != nil {
 		fmt.Printf("\n[Failed] 解析 m3u8 失败: %v\n", err)
 		return
 	}
-
-	// 3.1、自动识别文件名（默认 -o 未指定时，从流元数据提取时间戳）
 	d.AutoName(pwd)
 
 	fmt.Printf("待下载切片数量: %d", d.SegmentCount())
@@ -91,29 +107,43 @@ func Run() {
 	}
 	fmt.Println()
 
-	// 4、下载所有切片
 	d.DownloadAll()
 
-	// 5、校验下载结果
 	if err := d.Verify(); err != nil {
 		fmt.Printf("\n[Failed] %v\n", err)
 		return
 	}
 
-	// 6、合并切片
-	fmt.Println()
+	fmt.Print("正在合并...")
 	mv, err := d.Merge()
 	if err != nil {
 		fmt.Printf("\n[Failed] 合并失败: %v\n", err)
 		return
 	}
 
-	// 7、清理
 	if d.AutoClear() {
 		os.RemoveAll(d.OutputDir())
 	}
 
-	// 8、完成
 	util.DrawProgressBar("Merging", 1.0, dl.ProgressWidth, mv)
 	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", mv, time.Now().Sub(now).Seconds())
+}
+
+// ============================== RPC Server 模式 ==============================
+
+func runServer() {
+	mgr := task.NewManager(*maxDownload, *nFlag)
+
+	addr := fmt.Sprintf("127.0.0.1:%d", *rpcPort)
+	if *rpcListen {
+		addr = fmt.Sprintf("0.0.0.0:%d", *rpcPort)
+	}
+
+	srv := rpc.NewServer(addr, mgr, *rpcSecret)
+	fmt.Printf("[RPC] 服务启动: http://%s/jsonrpc\n", addr)
+	if *rpcSecret != "" {
+		fmt.Println("[RPC] 鉴权已启用 (token:****)")
+	}
+	fmt.Println("[RPC] 使用 AriaNg 连接此地址即可管理下载任务")
+	log.Fatal(srv.Start())
 }

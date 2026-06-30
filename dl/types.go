@@ -3,6 +3,7 @@ package dl
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,7 +15,6 @@ import (
 const (
 	DefaultTimeout = 30e9 // 30s (nanoseconds, 供外部使用)
 	ProgressWidth  = 20
-	MaxRetries     = 5
 )
 
 // ============================== 导出类型 ==============================
@@ -65,12 +65,15 @@ func (p *ProgressTracker) Draw(prefix string, width int) {
 	done := atomic.LoadInt64(&p.completed)
 	failed := atomic.LoadInt64(&p.failed)
 	total := p.total
-	ratio := float32(done+failed) / float32(total)
+	ok := done - failed // 实际成功数
+
+	ratio := float32(done) / float32(total)
 	if ratio > 1.0 {
 		ratio = 1.0
 	}
 	pos := int(ratio * float32(width))
-	s := fmt.Sprintf("[%s] %s%*s %6.2f%% (ok:%d fail:%d)",
-		prefix, strings.Repeat("■", pos), width-pos, "", ratio*100, done, failed)
+	s := fmt.Sprintf("[%s] %s%*s %6.2f%% (%d/%d, err:%d)",
+		prefix, strings.Repeat("■", pos), width-pos, "", ratio*100, ok, total, failed)
 	fmt.Print("\r" + s)
+	os.Stdout.Sync()
 }

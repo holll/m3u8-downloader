@@ -48,6 +48,10 @@ type Downloader struct {
 	hostType    string
 	reqOpts     *grequests.RequestOptions
 	progress    *ProgressTracker
+
+	// 回调 (供外部监下载进度)
+	onBytes    func(int64)
+	onProgress func(completed, total int64)
 }
 
 // New 创建下载器实例
@@ -84,6 +88,18 @@ func (d *Downloader) AutoClear() bool { return d.autoClear }
 
 // OutputDir 返回临时下载目录
 func (d *Downloader) OutputDir() string { return d.outputDir }
+
+// OnBytes 注册字节回调 (每次 HTTP 响应后触发)
+func (d *Downloader) OnBytes(fn func(int64)) { d.onBytes = fn }
+
+// OnProgress 注册进度回调 (每完成一个 segment 触发)
+func (d *Downloader) OnProgress(fn func(completed, total int64)) { d.onProgress = fn }
+
+// SegmentTotal 返回解析到的 total segments (供外部读取)
+func (d *Downloader) SegmentTotal() int64 { return int64(len(d.segments)) }
+
+// SetOutputFile 覆盖输出文件路径 (供 RPC 模式按选项设置)
+func (d *Downloader) SetOutputFile(path string) { d.outputFile = path }
 
 // AutoName 从流的 PROGRAM-DATE-TIME 元数据自动生成输出文件名。
 // baseDir 是最终输出文件所在的目录（通常为当前工作目录）。

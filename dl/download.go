@@ -67,28 +67,41 @@ func (d *Downloader) downloadSegment(seg Segment) error {
 	filePath := filepath.Join(d.outputDir, fmt.Sprintf("%05d%s", seg.Index, ext))
 
 	if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
+		if d.onProgress != nil {
+			d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
+		}
 		return nil
 	}
 
-	if seg.Map != nil {
-		initPath := filepath.Join(d.outputDir, fmt.Sprintf("init_%05d.mp4", seg.Index))
-		if _, err := os.Stat(initPath); os.IsNotExist(err) {
-			if err := d.downloadInitSegment(seg.Map, initPath); err != nil {
-				return fmt.Errorf("init segment: %w", err)
+	for attempt := 0; ; attempt++ {
+		// 退避延迟：500ms→1s→1.5s→...封顶30s
+		delay := time.Duration(attempt+1) * 500 * time.Millisecond
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+		if attempt > 0 {
+			time.Sleep(delay)
+		}
+
+		// 下载 init segment（仅当与切片主体不同文件时才需要）
+		if seg.Map != nil && seg.Map.URI != seg.URL {
+			initPath := filepath.Join(d.outputDir, fmt.Sprintf("init_%05d.mp4", seg.Index))
+			if _, err := os.Stat(initPath); os.IsNotExist(err) {
+				if err := d.downloadInitSegment(seg.Map, initPath); err != nil {
+					continue
+				}
 			}
 		}
-	}
 
-	var lastErr error
-	for attempt := 0; attempt < MaxRetries; attempt++ {
-		if err := d.downloadSingle(seg, filePath); err == nil {
+		// 下载切片主体
+		err := d.downloadSingle(seg, filePath)
+		if err == nil {
+			if d.onProgress != nil {
+				d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
+			}
 			return nil
-		} else {
-			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 		}
 	}
-	return fmt.Errorf("after %d retries: %w", MaxRetries, lastErr)
 }
 
 func (d *Downloader) downloadSingle(seg Segment, filePath string) error {
@@ -103,6 +116,10 @@ func (d *Downloader) downloadSingle(seg Segment, filePath string) error {
 	data := resp.Bytes()
 	if len(data) == 0 {
 		return fmt.Errorf("empty response")
+	}
+
+	if d.onBytes != nil {
+		d.onBytes(int64(len(data)))
 	}
 
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
