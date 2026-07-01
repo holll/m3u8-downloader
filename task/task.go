@@ -269,6 +269,7 @@ func (t *Task) Start(onDone func()) {
 			dl.AutoName(outDir)
 			t.out = strings.TrimSuffix(filepath.Base(dl.OutputFile()), ".mp4")
 		}
+		outName = t.out // 同步局部变量，确保 progress 文件名正确
 
 		// 输出文件已存在则跳过下载
 		outputPath := filepath.Join(outDir, t.out+".mp4")
