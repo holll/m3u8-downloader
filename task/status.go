@@ -146,6 +146,35 @@ type Options struct {
 	MaxWorkers int    `json:"max-connection-per-server,omitempty"`
 }
 
+// ============================== 会话持久化 ==============================
+
+// SessionEntry 会话文件中的单个任务条目，用于重启后恢复。
+type SessionEntry struct {
+	GID               string `json:"gid"`
+	URL               string `json:"url"`
+	Dir               string `json:"dir"`
+	Out               string `json:"out"`
+	Cookie            string `json:"cookie,omitempty"`
+	MaxWorkers        int    `json:"maxWorkers"`
+	Status            string `json:"status"`
+	TempDir           string `json:"tempDir,omitempty"`
+	TotalSegments     int64  `json:"totalSegments"`
+	CompletedSegments int64  `json:"completedSegments"`
+	BytesReceived     int64  `json:"bytesReceived"`
+}
+
+// ============================== 进度持久化 ==============================
+
+// ProgressFile 单个任务的断点续传进度文件 ({gid}.progress)。
+// 位于下载临时目录，每完成一批切片后更新。
+type ProgressFile struct {
+	GID               string    `json:"gid"`
+	TotalSegments     int64     `json:"totalSegments"`
+	CompletedSegments int64     `json:"completedSegments"`
+	BytesReceived     int64     `json:"bytesReceived"`
+	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
 // ============================== 时间 ==============================
 
 var now = time.Now // 允许测试中替换

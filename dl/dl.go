@@ -28,6 +28,7 @@ type Config struct {
 	AutoName   bool
 	Cookie     string
 	Insecure   bool
+	Quiet      bool // 静默模式：不打印终端进度条（Server 模式）
 }
 
 // ============================== Downloader ==============================
@@ -46,6 +47,7 @@ type Downloader struct {
 	autoClear   bool
 	autoName    bool
 	hostType    string
+	quiet       bool // 不打印进度条
 	reqOpts     *grequests.RequestOptions
 	progress    *ProgressTracker
 
@@ -64,6 +66,7 @@ func New(cfg Config) *Downloader {
 		hostType:   cfg.HostType,
 		autoClear:  cfg.AutoClear,
 		autoName:   cfg.AutoName,
+		quiet:      cfg.Quiet,
 	}
 	d.initRequestOptions(cfg.Cookie, cfg.Insecure)
 	return d

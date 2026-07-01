@@ -246,9 +246,11 @@ func handleShutdown(params json.RawMessage, mgr *task.Manager) (interface{}, err
 }
 
 func handlePauseAll(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	mgr.PauseAll()
 	return "OK", nil
 }
 
 func handleUnpauseAll(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	mgr.UnpauseAll()
 	return "OK", nil
 }

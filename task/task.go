@@ -3,6 +3,7 @@ package task
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -37,6 +38,9 @@ type Task struct {
 	out        string
 	cookie     string
 	maxWorkers int
+
+	// 持久化
+	tempDir string // 下载临时目录路径（重启后恢复用）
 
 	// 统计 (atomic)
 	completedLength int64 // 已完成分段数 (供进度条百分比)
@@ -100,6 +104,13 @@ func (t *Task) setStatus(s Status) {
 	}
 }
 
+// setStatusSilent 不触发 onUpdate 回调（用于会话恢复）
+func (t *Task) setStatusSilent(s Status) {
+	t.statusMu.Lock()
+	t.status = s
+	t.statusMu.Unlock()
+}
+
 // --- 统计更新 ---
 
 func (t *Task) addBytes(n int64) {
@@ -112,6 +123,22 @@ func (t *Task) addSegment() {
 
 func (t *Task) setSegmentTotal(n int64) {
 	atomic.StoreInt64(&t.totalLength, n)
+	// m3u8 可能更换过，cap 防止 completed > total
+	t.capCompletedAtTotal()
+}
+
+// capCompletedAtTotal 确保 completedLength ≤ totalLength
+func (t *Task) capCompletedAtTotal() {
+	total := atomic.LoadInt64(&t.totalLength)
+	for {
+		completed := atomic.LoadInt64(&t.completedLength)
+		if completed <= total {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&t.completedLength, completed, total) {
+			return
+		}
+	}
 }
 
 func (t *Task) setError(code, msg string) {
@@ -168,22 +195,33 @@ func (t *Task) Start(onDone func()) {
 	t.setStatus(StatusActive)
 
 	go func() {
+		var dlDir string   // 提前声明，供 defer 闭包捕获
+		var outDir string  // ditto
+		var outName string // ditto
+
 		defer func() {
+			// 异常退出时保存进度（暂停/错误）
+			t.trySaveProgress(outDir, outName)
 			if onDone != nil {
 				onDone()
 			}
 		}()
 
 		// 创建下载器
-		outDir := t.dir
+		outDir = t.dir
 		if outDir == "" {
 			outDir = "."
 		}
-		outName := t.out
+		outName = t.out
 		if outName == "" {
 			outName = t.GID
 		}
-		dlDir := filepath.Join(os.TempDir(), "m3u8_"+outName)
+		// 恢复时使用已保存的临时目录，否则新建
+		dlDir = t.tempDir
+		if dlDir == "" {
+			dlDir = filepath.Join(os.TempDir(), "m3u8_"+outName)
+		}
+		t.tempDir = dlDir
 		if err := os.MkdirAll(dlDir, 0755); err != nil {
 			t.setError("1", fmt.Sprintf("mkdir: %v", err))
 			return
@@ -198,10 +236,29 @@ func (t *Task) Start(onDone func()) {
 		dl.OnProgress(func(completed, total int64) {
 			t.addSegment()
 			t.setSegmentTotal(total)
+			// 每 20 个切片写一次进度文件（输出目录下 xxx.mp4.progress）
+			if completed > 0 && completed%20 == 0 {
+				t.saveProgress(outDir, outName)
+			}
 		})
 
 		// Phase 1: Parse
+		log.Printf("[task %s] 开始解析 %s", t.GID, t.url)
 		if err := dl.Parse(); err != nil {
+			// 解析失败但输出文件已知且已存在 → 视为已完成
+			if t.out != "" {
+				outputPath := filepath.Join(outDir, t.out+".mp4")
+				if info, statErr := os.Stat(outputPath); statErr == nil && info.Size() > 0 {
+					log.Printf("[task %s] 文件已存在，跳过: %s", t.GID, outputPath)
+					t.setSegmentTotal(1)
+					atomic.StoreInt64(&t.completedLength, 1)
+					os.RemoveAll(dlDir)
+					os.Remove(outputPath + ".progress")
+					t.setStatus(StatusComplete)
+					t.finishedAt = now()
+					return
+				}
+			}
 			t.setError("1", fmt.Sprintf("parse: %v", err))
 			return
 		}
@@ -213,28 +270,46 @@ func (t *Task) Start(onDone func()) {
 			t.out = strings.TrimSuffix(filepath.Base(dl.OutputFile()), ".mp4")
 		}
 
+		// 输出文件已存在则跳过下载
+		outputPath := filepath.Join(outDir, t.out+".mp4")
+		if info, err := os.Stat(outputPath); err == nil && info.Size() > 0 {
+			log.Printf("[task %s] 文件已存在，跳过: %s", t.GID, outputPath)
+			t.setSegmentTotal(1)
+			atomic.StoreInt64(&t.completedLength, 1)
+			os.RemoveAll(dlDir)                 // 清理可能残留的临时目录
+			os.Remove(outputPath + ".progress") // 清理进度文件
+			t.setStatus(StatusComplete)
+			t.finishedAt = now()
+			return
+		}
+
 		// 检查是否已暂停/取消
 		if t.Status() == StatusPaused || t.Status() == StatusRemoved {
 			return
 		}
 
 		// Phase 2: Download
+		log.Printf("[task %s] 开始下载 %d 个分片 (%d 线程)", t.GID, dl.SegmentCount(), t.maxWorkers)
 		dl.DownloadAll()
+		log.Printf("[task %s] 分片下载完成", t.GID)
 
 		if t.Status() == StatusPaused || t.Status() == StatusRemoved {
 			return
 		}
 
 		// Phase 3: Merge
+		log.Printf("[task %s] 开始合并 → %s/%s.mp4", t.GID, outDir, t.out)
 		os.MkdirAll(outDir, 0755)
 		dl.SetOutputFile(outDir + "/" + t.out + ".mp4")
 		if _, err := dl.Merge(); err != nil {
 			t.setError("2", fmt.Sprintf("merge: %v", err))
 			return
 		}
+		log.Printf("[task %s] 合并完成", t.GID)
 
-		// 清理临时目录
+		// 清理临时目录 & 进度文件
 		os.RemoveAll(dlDir)
+		os.Remove(filepath.Join(outDir, t.out+".mp4.progress"))
 
 		log.Printf("[task %s] complete: %s/%s.mp4", t.GID, outDir, t.out)
 		t.setStatus(StatusComplete)
@@ -323,7 +398,7 @@ func (t *Task) Snapshot() TaskStatus {
 	return ts
 }
 
-// getDL 创建 dl.Downloader 实例 (包级 helper)
+// getDL 创建 dl.Downloader 实例 (包级 helper, Server 模式静默)
 func getDL(url, outputDir string, maxWorkers int, cookie string) *dl.Downloader {
 	cfg := dl.Config{
 		M3U8URL:    url,
@@ -334,6 +409,114 @@ func getDL(url, outputDir string, maxWorkers int, cookie string) *dl.Downloader 
 		AutoName:   true,
 		Cookie:     cookie,
 		Insecure:   false,
+		Quiet:      true, // Server 模式不打印进度条
 	}
 	return dl.New(cfg)
+}
+
+// ============================== 会话持久化 ==============================
+
+// SessionEntry 导出任务当前状态，供会话文件保存。
+func (t *Task) SessionEntry() SessionEntry {
+	return SessionEntry{
+		GID:               t.GID,
+		URL:               t.url,
+		Dir:               t.dir,
+		Out:               t.out,
+		Cookie:            t.cookie,
+		MaxWorkers:        t.maxWorkers,
+		Status:            t.Status().String(),
+		TempDir:           t.tempDir,
+		TotalSegments:     atomic.LoadInt64(&t.totalLength),
+		CompletedSegments: atomic.LoadInt64(&t.completedLength),
+		BytesReceived:     atomic.LoadInt64(&t.bytesReceived),
+	}
+}
+
+// RestoreTask 从会话条目恢复任务（不触发 onUpdate）。
+func RestoreTask(entry SessionEntry, onUpdate func()) *Task {
+	n := entry.MaxWorkers
+	if n <= 0 {
+		n = 3
+	}
+	t := &Task{
+		GID:        entry.GID,
+		url:        entry.URL,
+		dir:        entry.Dir,
+		out:        entry.Out,
+		cookie:     entry.Cookie,
+		maxWorkers: n,
+		tempDir:    entry.TempDir,
+		createdAt:  now(),
+		onUpdate:   onUpdate,
+		doneCh:     make(chan struct{}),
+	}
+	atomic.StoreInt64(&t.totalLength, entry.TotalSegments)
+	atomic.StoreInt64(&t.completedLength, entry.CompletedSegments)
+	atomic.StoreInt64(&t.bytesReceived, entry.BytesReceived)
+
+	// 如果输出目录下有 .progress 文件，用其中的进度覆盖（更精确）
+	if entry.Dir != "" && entry.Out != "" {
+		if pf, err := loadProgress(entry.Dir, entry.Out); err == nil {
+			atomic.StoreInt64(&t.totalLength, pf.TotalSegments)
+			atomic.StoreInt64(&t.completedLength, pf.CompletedSegments)
+			atomic.StoreInt64(&t.bytesReceived, pf.BytesReceived)
+		}
+	}
+
+	// 恢复后统一设为 waiting，由 Manager 调度
+	switch entry.Status {
+	case "paused":
+		t.setStatusSilent(StatusPaused)
+	default:
+		t.setStatusSilent(StatusWaiting)
+	}
+	return t
+}
+
+// ============================== 进度文件 (xxx.mp4.progress) ==============================
+
+// saveProgress 将当前下载进度写入输出目录，文件名为 {out}.mp4.progress。
+// 例如 /data/1.mp4 → /data/1.mp4.progress
+func (t *Task) saveProgress(outDir, out string) {
+	total := atomic.LoadInt64(&t.totalLength)
+	completed := atomic.LoadInt64(&t.completedLength)
+	if completed > total {
+		completed = total
+	}
+	pf := ProgressFile{
+		GID:               t.GID,
+		TotalSegments:     total,
+		CompletedSegments: completed,
+		BytesReceived:     atomic.LoadInt64(&t.bytesReceived),
+		UpdatedAt:         now(),
+	}
+	data, err := json.Marshal(pf)
+	if err != nil {
+		return
+	}
+	path := filepath.Join(outDir, out+".mp4.progress")
+	os.WriteFile(path, data, 0644)
+}
+
+// trySaveProgress 仅在暂停/错误状态下保存进度。
+func (t *Task) trySaveProgress(outDir, out string) {
+	s := t.Status()
+	if s == StatusPaused || s == StatusError {
+		t.saveProgress(outDir, out)
+	}
+}
+
+// loadProgress 从 {outDir}/{out}.mp4.progress 读取进度。
+func loadProgress(outDir, out string) (*ProgressFile, error) {
+	path := filepath.Join(outDir, out+".mp4.progress")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var pf ProgressFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		return nil, err
+	}
+	return &pf, nil
 }

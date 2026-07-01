@@ -1,0 +1,54 @@
+# ============================================================
+# m3u8-downloader 配置文件示例
+# 用法: .\m3u8-downloader.exe --conf-path=m3u8.conf
+# 格式: key=value，空行和 # 开头为注释
+# 优先级: CLI 参数 > 配置文件 > 默认值
+# ============================================================
+
+# ---- RPC 服务 (Server 模式) ----
+
+# RPC 监听端口。设为 0 则进入 CLI 单任务模式。
+# 类型: int  默认: 0
+rpc-listen-port=6800
+
+# RPC 鉴权密钥。空字符串表示无鉴权（不推荐）。
+# 类型: string  默认: ""
+rpc-secret=your_secret_here
+
+# 是否监听所有网卡。false 仅监听 127.0.0.1，true 监听 0.0.0.0。
+# 类型: bool  默认: false
+rpc-listen-all=false
+
+# 最大同时下载任务数。
+# 类型: int  默认: 1
+max-concurrent-downloads=1
+
+# 会话文件路径，用于保存未完成任务列表，重启后自动恢复。
+# 类型: string  默认: m3u8.session
+session-file=m3u8.session
+
+# ---- 下载选项 (CLI / 单任务均生效) ----
+
+# 单任务并发下载线程数。
+# 类型: int  默认: 3
+n=8
+
+# m3u8 地址拼接策略。v1: scheme://host + path 目录  v2: scheme://host
+# 类型: string  可选: v1 | v2  默认: v1
+ht=v1
+
+# 自定义 Cookie，格式: key1=val1; key2=val2
+# 类型: string  默认: ""
+c=
+
+# 下载完成后是否自动清除临时 ts 文件。
+# 类型: bool  默认: true
+r=true
+
+# 是否跳过 HTTPS 证书校验（0=否, 1=是）。
+# 类型: int  默认: 0
+s=0
+
+# 文件保存路径（绝对路径）。空字符串表示当前目录。
+# 类型: string  默认: ""
+sp=

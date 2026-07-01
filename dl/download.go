@@ -24,19 +24,22 @@ func (d *Downloader) DownloadAll() {
 	var wg sync.WaitGroup
 	limiter := make(chan struct{}, d.maxWorkers)
 
-	doneCh := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-doneCh:
-				return
-			case <-ticker.C:
-				d.progress.Draw("Downloading", ProgressWidth)
+	if !d.quiet {
+		doneCh := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-doneCh:
+					return
+				case <-ticker.C:
+					d.progress.Draw("Downloading", ProgressWidth)
+				}
 			}
-		}
-	}()
+		}()
+		defer func() { close(doneCh) }()
+	}
 
 	for i := range d.segments {
 		wg.Add(1)
@@ -48,15 +51,19 @@ func (d *Downloader) DownloadAll() {
 			}()
 			if err := d.downloadSegment(seg); err != nil {
 				d.progress.Fail()
-				Log.Printf("[warn] segment %d failed: %v", seg.Index, err)
+				if !d.quiet {
+					Log.Printf("[warn] segment %d failed: %v", seg.Index, err)
+				}
 			}
 			d.progress.Done()
 		}(d.segments[i])
 	}
 	wg.Wait()
-	close(doneCh)
-	d.progress.Draw("Downloading", ProgressWidth)
-	fmt.Println()
+
+	if !d.quiet {
+		d.progress.Draw("Downloading", ProgressWidth)
+		fmt.Println()
+	}
 }
 
 func (d *Downloader) downloadSegment(seg Segment) error {

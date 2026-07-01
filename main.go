@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"m3u8-downloader/config"
 	"m3u8-downloader/dl"
 	"m3u8-downloader/rpc"
 	"m3u8-downloader/task"
@@ -42,6 +43,8 @@ var (
 	rpcSecret   = flag.String("rpc-secret", "", "RPC鉴权token(空=无鉴权)")
 	rpcListen   = flag.Bool("rpc-listen-all", false, "监听所有网卡(默认仅localhost)")
 	maxDownload = flag.Int("max-concurrent-downloads", 1, "最大同时下载数(Server模式, 默认1)")
+	sessionFile = flag.String("session-file", "m3u8.session", "会话文件路径(保存未完成任务, 重启恢复)")
+	confPath    = flag.String("conf-path", "", "配置文件路径(key=value格式, CLI参数优先)")
 )
 
 func main() {
@@ -50,6 +53,10 @@ func main() {
 
 // Run 主流程
 func Run() {
+	// 0. 从命令行参数中提前提取 --conf-path，加载配置文件
+	loadConfigFromArgs()
+
+	// 1. 解析命令行参数（CLI 参数优先级高于配置文件）
 	flag.Parse()
 
 	if *rpcPort != 0 {
@@ -57,6 +64,53 @@ func Run() {
 	} else {
 		runCLI()
 	}
+}
+
+// loadConfigFromArgs 从 os.Args 中提取 --conf-path，加载配置文件，
+// 并用配置项设置 flag 默认值（后续 flag.Parse() 会用 CLI 参数覆盖）。
+func loadConfigFromArgs() {
+	cfgPath := peekConfPath(os.Args[1:])
+	if cfgPath == "" {
+		return
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		log.Printf("[config] 加载失败: %v", err)
+		return
+	}
+
+	for k, v := range cfg {
+		// 不覆盖已从环境变量或其他来源设置的值
+		if err := flag.Set(k, v); err != nil {
+			log.Printf("[config] 跳过未知配置项: %s=%s", k, v)
+		}
+	}
+	log.Printf("[config] 已从 %s 加载 %d 条配置", cfgPath, len(cfg))
+}
+
+// peekConfPath 从参数列表中提取 --conf-path 的值。
+// 支持 --conf-path=value 和 --conf-path value 两种格式。
+func peekConfPath(args []string) string {
+	for i, a := range args {
+		// --conf-path=value
+		if after, ok := strings.CutPrefix(a, "--conf-path="); ok {
+			return after
+		}
+		// --conf-path value
+		if a == "--conf-path" && i+1 < len(args) {
+			return args[i+1]
+		}
+		// -conf-path=value
+		if after, ok := strings.CutPrefix(a, "-conf-path="); ok {
+			return after
+		}
+		// -conf-path value
+		if a == "-conf-path" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 // ============================== CLI 模式 ==============================
@@ -135,7 +189,14 @@ func runCLI() {
 // ============================== RPC Server 模式 ==============================
 
 func runServer() {
-	mgr := task.NewManager(*maxDownload, *nFlag)
+	mgr := task.NewManager(*maxDownload, *nFlag, *sessionFile)
+
+	// 恢复上次未完成的任务
+	if *sessionFile != "" {
+		if err := mgr.LoadSession(*sessionFile); err != nil {
+			log.Printf("[session] 加载失败: %v", err)
+		}
+	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", *rpcPort)
 	if *rpcListen {
@@ -166,6 +227,15 @@ func runServer() {
 		fmt.Printf("\n[RPC] 收到信号 %v，正在关闭...\n", sig)
 		srv.Stop()
 		<-errCh // 等待 Serve 返回
+
+		// 最终保存会话（同步，确保不丢数据）
+		if *sessionFile != "" {
+			if err := mgr.SaveSession(*sessionFile); err != nil {
+				log.Printf("[session] 保存失败: %v", err)
+			} else {
+				log.Println("[session] 会话已保存")
+			}
+		}
 		fmt.Println("[RPC] 服务已停止")
 	case err := <-errCh:
 		if err != nil && err != http.ErrServerClosed {
