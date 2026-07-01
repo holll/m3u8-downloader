@@ -9,10 +9,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"m3u8-downloader/dl"
@@ -145,5 +148,28 @@ func runServer() {
 		fmt.Println("[RPC] 鉴权已启用 (token:****)")
 	}
 	fmt.Println("[RPC] 使用 AriaNg 连接此地址即可管理下载任务")
-	log.Fatal(srv.Start())
+
+	// 信号处理：Ctrl+C 或 kill 时优雅关闭
+	// 注意：Windows 上 Ctrl+C 发送 os.Interrupt，而非 SIGINT
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	// 在 goroutine 中启动服务
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Start()
+	}()
+
+	// 等待信号或启动错误
+	select {
+	case sig := <-sigCh:
+		fmt.Printf("\n[RPC] 收到信号 %v，正在关闭...\n", sig)
+		srv.Stop()
+		<-errCh // 等待 Serve 返回
+		fmt.Println("[RPC] 服务已停止")
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[RPC] 服务异常退出: %v", err)
+		}
+	}
 }

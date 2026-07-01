@@ -25,7 +25,8 @@ type Server struct {
 	secret   string
 	addr     string
 	hs       *http.Server
-	reqCount int64 // atomic request counter
+	ln       net.Listener // 手动创建的 listener，用于显式关闭
+	reqCount int64        // atomic request counter
 }
 
 // NewServer 创建服务实例
@@ -37,21 +38,31 @@ func NewServer(addr string, mgr *task.Manager, secret string) *Server {
 	}
 }
 
-// Start 启动 HTTP 服务，阻塞直到 Stop()
+// Start 启动 HTTP 服务，阻塞直到 Stop() 或监听失败。
+// 使用 SO_REUSEADDR 允许快速重启（Windows 上进程退出后端口可立即复用）。
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jsonrpc", s.handleJSONRPC)
 
+	ln, err := createListener(s.addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", s.addr, err)
+	}
+	s.ln = ln // 保存以便显式关闭
+
 	s.hs = &http.Server{
-		Addr:    s.addr,
 		Handler: withCORS(mux),
 	}
 	fmt.Printf("[RPC] listening on http://%s/jsonrpc\n", s.addr)
-	return s.hs.ListenAndServe()
+	return s.hs.Serve(ln)
 }
 
-// Stop 优雅关闭
+// Stop 立即关闭（主动关闭 listener + http.Server）
 func (s *Server) Stop() error {
+	// 先关闭 listener，确保 Accept 立即返回
+	if s.ln != nil {
+		s.ln.Close()
+	}
 	if s.hs != nil {
 		return s.hs.Close()
 	}
