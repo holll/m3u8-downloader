@@ -29,14 +29,15 @@ import (
 
 var (
 	// CLI 模式
-	urlFlag = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
-	nFlag   = flag.Int("n", 3, "num:下载线程数(默认3)")
-	htFlag  = flag.String("ht", "v1", "hostType: v1/v2")
-	oFlag   = flag.String("o", "movie", "movieName:自定义文件名(默认为movie)")
-	cFlag   = flag.String("c", "", "cookie:自定义请求cookie")
-	rFlag   = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
-	sFlag   = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求")
-	spFlag  = flag.String("sp", "", "savePath:文件保存的绝对路径")
+	urlFlag  = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
+	nFlag    = flag.Int("n", 3, "num:下载线程数(默认3)")
+	htFlag   = flag.String("ht", "v1", "hostType: v1/v2")
+	oFlag    = flag.String("o", "movie", "movieName:自定义文件名(默认为movie)")
+	cFlag    = flag.String("c", "", "cookie:自定义请求cookie")
+	rFlag    = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
+	sFlag    = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求")
+	spFlag   = flag.String("sp", "", "savePath:文件保存的绝对路径")
+	maxRetry = flag.Int("max-retry", 5, "单分片最大重试次数(默认5, 5次失败则任务失败)")
 
 	// RPC Server 模式
 	rpcPort     = flag.Int("rpc-listen-port", 0, "RPC监听端口(0=CLI模式, 非0=Server模式)")
@@ -147,6 +148,7 @@ func runCLI() {
 		AutoName:   *oFlag == "movie",
 		Cookie:     *cFlag,
 		Insecure:   *sFlag != 0,
+		MaxRetry:   *maxRetry,
 	})
 
 	if err := d.Parse(); err != nil {

@@ -2,6 +2,7 @@ package task
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,7 @@ type Task struct {
 	out        string
 	cookie     string
 	maxWorkers int
+	maxRetry   int // 单分片重试次数
 
 	// 持久化
 	tempDir string // 下载临时目录路径（重启后恢复用）
@@ -73,6 +75,10 @@ func NewTask(url string, opts Options, onUpdate func()) *Task {
 	if n <= 0 {
 		n = 3
 	}
+	r := opts.MaxRetry
+	if r <= 0 {
+		r = 5
+	}
 	return &Task{
 		GID:        newGID(),
 		status:     StatusWaiting,
@@ -81,6 +87,7 @@ func NewTask(url string, opts Options, onUpdate func()) *Task {
 		out:        opts.Out,
 		cookie:     opts.Cookie,
 		maxWorkers: n,
+		maxRetry:   r,
 		createdAt:  now(),
 		onUpdate:   onUpdate,
 		doneCh:     make(chan struct{}),
@@ -216,10 +223,11 @@ func (t *Task) Start(onDone func()) {
 		if outName == "" {
 			outName = t.GID
 		}
-		// 恢复时使用已保存的临时目录，否则新建
+		// 恢复时使用已保存的临时目录；否则基于 URL 哈希创建确定性目录（支持断点续传）
 		dlDir = t.tempDir
 		if dlDir == "" {
-			dlDir = filepath.Join(os.TempDir(), "m3u8_"+outName)
+			hash := sha256.Sum256([]byte(t.url))
+			dlDir = filepath.Join(os.TempDir(), "m3u8_"+hex.EncodeToString(hash[:8]))
 		}
 		t.tempDir = dlDir
 		if err := os.MkdirAll(dlDir, 0755); err != nil {
@@ -227,7 +235,7 @@ func (t *Task) Start(onDone func()) {
 			return
 		}
 
-		dl := getDL(t.url, dlDir, t.maxWorkers, t.cookie)
+		dl := getDL(t.url, dlDir, t.maxWorkers, t.maxRetry, t.cookie)
 
 		// 注册回调
 		dl.OnBytes(func(n int64) {
@@ -400,7 +408,7 @@ func (t *Task) Snapshot() TaskStatus {
 }
 
 // getDL 创建 dl.Downloader 实例 (包级 helper, Server 模式静默)
-func getDL(url, outputDir string, maxWorkers int, cookie string) *dl.Downloader {
+func getDL(url, outputDir string, maxWorkers, maxRetry int, cookie string) *dl.Downloader {
 	cfg := dl.Config{
 		M3U8URL:    url,
 		OutputDir:  outputDir,
@@ -411,6 +419,7 @@ func getDL(url, outputDir string, maxWorkers int, cookie string) *dl.Downloader 
 		Cookie:     cookie,
 		Insecure:   false,
 		Quiet:      true, // Server 模式不打印进度条
+		MaxRetry:   maxRetry,
 	}
 	return dl.New(cfg)
 }

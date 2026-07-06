@@ -29,6 +29,7 @@ type Config struct {
 	Cookie     string
 	Insecure   bool
 	Quiet      bool // 静默模式：不打印终端进度条（Server 模式）
+	MaxRetry   int  // 单分片最大重试次数（0 或不设置 = 无限）
 }
 
 // ============================== Downloader ==============================
@@ -48,6 +49,7 @@ type Downloader struct {
 	autoName    bool
 	hostType    string
 	quiet       bool // 不打印进度条
+	maxRetry    int  // 单分片最大重试次数
 	reqOpts     *grequests.RequestOptions
 	progress    *ProgressTracker
 
@@ -67,6 +69,10 @@ func New(cfg Config) *Downloader {
 		autoClear:  cfg.AutoClear,
 		autoName:   cfg.AutoName,
 		quiet:      cfg.Quiet,
+		maxRetry:   cfg.MaxRetry,
+	}
+	if d.maxRetry <= 0 {
+		d.maxRetry = 5
 	}
 	d.initRequestOptions(cfg.Cookie, cfg.Insecure)
 	return d

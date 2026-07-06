@@ -80,7 +80,7 @@ func (d *Downloader) downloadSegment(seg Segment) error {
 		return nil
 	}
 
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt <= d.maxRetry; attempt++ {
 		// 退避延迟：500ms→1s→1.5s→...封顶30s
 		delay := time.Duration(attempt+1) * 500 * time.Millisecond
 		if delay > 30*time.Second {
@@ -109,6 +109,7 @@ func (d *Downloader) downloadSegment(seg Segment) error {
 			return nil
 		}
 	}
+	return fmt.Errorf("segment %d failed after %d retries", seg.Index, d.maxRetry+1)
 }
 
 func (d *Downloader) downloadSingle(seg Segment, filePath string) error {

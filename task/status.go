@@ -144,6 +144,7 @@ type Options struct {
 	Cookie     string `json:"cookie,omitempty"`
 	Header     string `json:"header,omitempty"` // 暂未使用
 	MaxWorkers int    `json:"max-connection-per-server,omitempty"`
+	MaxRetry   int    `json:"max-retry,omitempty"` // 分片重试次数（0 = 取默认值 5）
 }
 
 // ============================== 会话持久化 ==============================

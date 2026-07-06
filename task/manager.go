@@ -13,6 +13,7 @@ import (
 // Manager 任务管理器
 type Manager struct {
 	tasks         map[string]*Task
+	taskOrder     []string // GID 插入顺序，保证 FIFO 调度
 	mu            sync.RWMutex
 	activeLimit   int
 	activeCount   int
@@ -34,6 +35,7 @@ func NewManager(maxConcurrent, defaultWorkers int, sessionFile string) *Manager 
 	}
 	return &Manager{
 		tasks:         make(map[string]*Task),
+		taskOrder:     make([]string, 0),
 		activeLimit:   maxConcurrent,
 		stoppedMax:    1000,
 		defaultWorker: defaultWorkers,
@@ -56,6 +58,7 @@ func (m *Manager) AddURI(url string, opts Options) (string, error) {
 
 	m.mu.Lock()
 	m.tasks[t.GID] = t
+	m.taskOrder = append(m.taskOrder, t.GID)
 	m.mu.Unlock()
 
 	// 尝试立即启动
@@ -97,6 +100,12 @@ func (m *Manager) RemoveDownloadResult(gid string) error {
 	}
 	m.mu.Lock()
 	delete(m.tasks, gid)
+	for i, id := range m.taskOrder {
+		if id == gid {
+			m.taskOrder = append(m.taskOrder[:i], m.taskOrder[i+1:]...)
+			break
+		}
+	}
 	m.mu.Unlock()
 	return nil
 }
@@ -133,8 +142,8 @@ func (m *Manager) Unpause(gid string) error {
 func (m *Manager) PauseAll() {
 	m.mu.RLock()
 	active := make([]*Task, 0)
-	for _, t := range m.tasks {
-		if t.Status() == StatusActive {
+	for _, gid := range m.taskOrder {
+		if t, ok := m.tasks[gid]; ok && t.Status() == StatusActive {
 			active = append(active, t)
 		}
 	}
@@ -149,8 +158,8 @@ func (m *Manager) PauseAll() {
 func (m *Manager) UnpauseAll() {
 	m.mu.RLock()
 	paused := make([]*Task, 0)
-	for _, t := range m.tasks {
-		if t.Status() == StatusPaused {
+	for _, gid := range m.taskOrder {
+		if t, ok := m.tasks[gid]; ok && t.Status() == StatusPaused {
 			paused = append(paused, t)
 		}
 	}
@@ -248,10 +257,12 @@ func (m *Manager) GlobalStat() GlobalStat {
 	active := m.activeCount
 	waiting := 0
 	stopped := len(m.stoppedList)
-	for _, t := range m.tasks {
-		s := t.Status()
-		if s == StatusWaiting || s == StatusPaused {
-			waiting++
+	for _, gid := range m.taskOrder {
+		if t, ok := m.tasks[gid]; ok {
+			s := t.Status()
+			if s == StatusWaiting || s == StatusPaused {
+				waiting++
+			}
 		}
 	}
 	m.mu.RUnlock()
@@ -311,8 +322,8 @@ func (m *Manager) tryStartNext() {
 		return
 	}
 
-	for _, t := range m.tasks {
-		if t.Status() == StatusWaiting {
+	for _, gid := range m.taskOrder {
+		if t, ok := m.tasks[gid]; ok && t.Status() == StatusWaiting {
 			m.activeCount++
 			go m.startTask(t)
 			return
@@ -356,8 +367,8 @@ func (m *Manager) collect(status Status) []TaskStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	result := make([]TaskStatus, 0)
-	for _, t := range m.tasks {
-		if t.Status() == status {
+	for _, gid := range m.taskOrder {
+		if t, ok := m.tasks[gid]; ok && t.Status() == status {
 			result = append(result, t.Snapshot())
 		}
 	}
@@ -371,7 +382,11 @@ func (m *Manager) collect(status Status) []TaskStatus {
 func (m *Manager) SaveSession(path string) error {
 	m.mu.RLock()
 	entries := make([]SessionEntry, 0, len(m.tasks))
-	for _, t := range m.tasks {
+	for _, gid := range m.taskOrder {
+		t, ok := m.tasks[gid]
+		if !ok {
+			continue
+		}
 		s := t.Status()
 		if s == StatusComplete || s == StatusError || s == StatusRemoved {
 			continue
@@ -415,6 +430,7 @@ func (m *Manager) LoadSession(path string) error {
 		}
 		t := RestoreTask(entry, m.onTaskUpdate)
 		m.tasks[t.GID] = t
+		m.taskOrder = append(m.taskOrder, t.GID)
 	}
 	m.mu.Unlock()
 
