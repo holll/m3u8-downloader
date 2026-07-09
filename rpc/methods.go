@@ -28,6 +28,7 @@ func init() {
 		"aria2.getVersion":           handleGetVersion,
 		"aria2.getSessionInfo":       handleGetSessionInfo,
 		"system.multicall":           handleMulticall,
+		"system.listMethods":         handleListMethods,
 		"aria2.getGlobalOption":      handleGetGlobalOption,
 		"aria2.changeGlobalOption":   handleChangeGlobalOption,
 		"aria2.shutdown":             handleShutdown,
@@ -35,6 +36,11 @@ func init() {
 		"aria2.forcePause":           handlePause,
 		"aria2.pauseAll":             handlePauseAll,
 		"aria2.unpauseAll":           handleUnpauseAll,
+		"aria2.purgeDownloadResult":  handlePurgeDownloadResult,
+		"aria2.getOption":            handleGetOption,
+		"aria2.changeOption":         handleChangeOption,
+		"aria2.getUris":              handleGetUris,
+		"aria2.getFiles":             handleGetFiles,
 	}
 }
 
@@ -199,51 +205,132 @@ func handleGetSessionInfo(params json.RawMessage, mgr *task.Manager) (interface{
 
 // ============================== system.multicall ==============================
 
+// multicallReq 解析 aria2 system.multicall 的子调用（methodName + params 数组）。
+type multicallReq struct {
+	MethodName string            `json:"methodName"`
+	Params     []json.RawMessage `json:"params"`
+}
+
 func handleMulticall(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
-	var calls []Request
-	if err := json.Unmarshal(params, &calls); err != nil {
+	// params 格式: [ [{methodName:"...", params:[...]}, ...] ]
+	// 先提取内层数组
+	var wrapper []multicallReq
+	if err := json.Unmarshal(params, &wrapper); err != nil {
 		return nil, errParams
 	}
 
-	results := make([]Response, 0, len(calls))
-	for _, req := range calls {
-		h, ok := methodTable[req.Method]
+	results := make([]interface{}, 0, len(wrapper))
+	for _, call := range wrapper {
+		h, ok := methodTable[call.MethodName]
 		if !ok {
-			results = append(results, newError(parseID(req.ID), errMethod))
+			// aria2 规范：multicall 错误返回 [faultCode, faultString]
+			results = append(results, []interface{}{1, "Method not found: " + call.MethodName})
 			continue
 		}
-		result, err := h(req.Params, mgr)
+		// 将 params 数组重新序列化为 json.RawMessage
+		paramsBytes, _ := json.Marshal(call.Params)
+		paramsRaw := json.RawMessage(paramsBytes)
+		// 移除 token（aria2 兼容）
+		paramsRaw = stripToken(paramsRaw)
+		result, err := h(paramsRaw, mgr)
 		if err != nil {
 			if rpcErr, ok := err.(*RPCError); ok {
-				results = append(results, newError(parseID(req.ID), rpcErr))
+				results = append(results, []interface{}{rpcErr.Code, rpcErr.Message})
 			} else {
-				results = append(results, newError(parseID(req.ID), errInternal))
+				results = append(results, []interface{}{1, err.Error()})
 			}
 			continue
 		}
-		results = append(results, newResponse(parseID(req.ID), result))
+		// 成功：直接返回结果值（aria2 规范）
+		results = append(results, result)
 	}
 	return results, nil
 }
 
-// ============================== 补充方法 (stub) ==============================
+// ============================== 补充方法 ==============================
+
+// --- system.listMethods ---
+
+func handleListMethods(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	methods := make([]string, 0, len(methodTable))
+	for m := range methodTable {
+		methods = append(methods, m)
+	}
+	return methods, nil
+}
+
+// --- 全局选项 ---
 
 func handleGetGlobalOption(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
-	return map[string]string{
-		"max-concurrent-downloads":   "1",
-		"max-connection-per-server":  "3",
-		"max-overall-download-limit": "0",
-		"dir":                        ".",
-	}, nil
+	return mgr.GlobalOption(), nil
 }
 
 func handleChangeGlobalOption(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var opts map[string]interface{}
+	if err := parseParams(params, &opts); err != nil {
+		return nil, err
+	}
+	if err := mgr.ChangeGlobalOption(opts); err != nil {
+		return nil, &RPCError{Code: ErrInternal, Message: err.Error()}
+	}
 	return "OK", nil
 }
 
+// --- 关闭 ---
+
 func handleShutdown(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	mgr.RequestShutdown()
 	return "OK", nil
 }
+
+// --- 批量清理 ---
+
+func handlePurgeDownloadResult(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	mgr.PurgeDownloadResult()
+	return "OK", nil
+}
+
+// --- 单任务选项 ---
+
+func handleGetOption(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var gid string
+	if err := parseParams(params, &gid); err != nil {
+		return nil, err
+	}
+	return mgr.GetOption(gid)
+}
+
+func handleChangeOption(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var gid string
+	var opts map[string]interface{}
+	if err := parseParams2(params, &gid, &opts); err != nil {
+		return nil, err
+	}
+	if err := mgr.ChangeOption(gid, opts); err != nil {
+		return nil, &RPCError{Code: 1, Message: err.Error()}
+	}
+	return "OK", nil
+}
+
+// --- URI / Files ---
+
+func handleGetUris(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var gid string
+	if err := parseParams(params, &gid); err != nil {
+		return nil, err
+	}
+	return mgr.GetUris(gid)
+}
+
+func handleGetFiles(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var gid string
+	if err := parseParams(params, &gid); err != nil {
+		return nil, err
+	}
+	return mgr.GetFiles(gid)
+}
+
+// --- 全部暂停/恢复 ---
 
 func handlePauseAll(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
 	mgr.PauseAll()

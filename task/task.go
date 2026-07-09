@@ -407,6 +407,79 @@ func (t *Task) Snapshot() TaskStatus {
 	return ts
 }
 
+// ============================== 选项查询/修改 ==============================
+
+// GetOption 返回任务的配置选项（aria2 兼容格式）。
+func (t *Task) GetOption() map[string]string {
+	return map[string]string{
+		"dir":                       t.dir,
+		"out":                       t.out,
+		"max-connection-per-server": itoa(int64(t.maxWorkers)),
+		"split":                     itoa(int64(t.maxWorkers)),
+	}
+}
+
+// ChangeOption 修改任务的配置选项。
+// 仅 waiting/paused 状态可修改；active/complete/error/removed 状态拒绝。
+func (t *Task) ChangeOption(opts map[string]interface{}) error {
+	s := t.Status()
+	if s == StatusActive || s == StatusComplete || s == StatusError || s == StatusRemoved {
+		return fmt.Errorf("cannot change option in status: %s", s)
+	}
+	if v, ok := opts["dir"]; ok {
+		if dir, ok := v.(string); ok && dir != "" {
+			t.dir = dir
+		}
+	}
+	if v, ok := opts["max-connection-per-server"]; ok {
+		t.maxWorkers = toInt(v)
+	}
+	if v, ok := opts["split"]; ok {
+		t.maxWorkers = toInt(v)
+	}
+	return nil
+}
+
+// GetUris 返回任务关联的 URI 列表。
+func (t *Task) GetUris() []URIInfo {
+	return []URIInfo{{URI: t.url, Status: "used"}}
+}
+
+// GetFiles 返回任务的文件列表。
+func (t *Task) GetFiles() []FileInfo {
+	dir := t.dir
+	out := t.out
+	if out == "" {
+		out = t.GID
+	}
+	outPath := dir
+	if outPath != "" && out != "" {
+		outPath = outPath + "/" + out + ".mp4"
+	}
+	segDone := atomic.LoadInt64(&t.completedLength)
+	segTotal := atomic.LoadInt64(&t.totalLength)
+	const segScale = 1 << 20
+	displayTotal := segTotal * segScale
+	displayDone := segDone * segScale
+	if displayDone > displayTotal && displayTotal > 0 {
+		displayDone = displayTotal
+	}
+	if s := t.Status(); s == StatusComplete {
+		displayDone = displayTotal
+	}
+	return []FileInfo{{
+		Index:           "1",
+		Path:            outPath,
+		Length:          itoa(displayTotal),
+		CompletedLength: itoa(displayDone),
+		Selected:        "true",
+		URIs: []URIInfo{{
+			URI:    t.url,
+			Status: "used",
+		}},
+	}}
+}
+
 // getDL 创建 dl.Downloader 实例 (包级 helper, Server 模式静默)
 func getDL(url, outputDir string, maxWorkers, maxRetry int, cookie string) *dl.Downloader {
 	cfg := dl.Config{

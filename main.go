@@ -191,7 +191,13 @@ func runCLI() {
 // ============================== RPC Server 模式 ==============================
 
 func runServer() {
-	mgr := task.NewManager(*maxDownload, *nFlag, *sessionFile)
+	// 全局默认下载目录：-sp 参数或当前目录
+	dir := *spFlag
+	if dir == "" {
+		dir = "."
+	}
+
+	mgr := task.NewManager(*maxDownload, *nFlag, dir, *sessionFile)
 
 	// 恢复上次未完成的任务
 	if *sessionFile != "" {
@@ -199,6 +205,16 @@ func runServer() {
 			log.Printf("[session] 加载失败: %v", err)
 		}
 	}
+
+	// aria2.shutdown RPC 触发通道
+	shutdownCh := make(chan struct{})
+	mgr.SetShutdownCallback(func() {
+		select {
+		case <-shutdownCh:
+		default:
+			close(shutdownCh)
+		}
+	})
 
 	addr := fmt.Sprintf("127.0.0.1:%d", *rpcPort)
 	if *rpcListen {
@@ -223,10 +239,9 @@ func runServer() {
 		errCh <- srv.Start()
 	}()
 
-	// 等待信号或启动错误
-	select {
-	case sig := <-sigCh:
-		fmt.Printf("\n[RPC] 收到信号 %v，正在关闭...\n", sig)
+	// 优雅关闭逻辑（复用）
+	gracefulStop := func(reason string) {
+		fmt.Printf("\n[RPC] %s，正在关闭...\n", reason)
 		srv.Stop()
 		<-errCh // 等待 Serve 返回
 
@@ -239,6 +254,14 @@ func runServer() {
 			}
 		}
 		fmt.Println("[RPC] 服务已停止")
+	}
+
+	// 等待信号、shutdown RPC 或启动错误
+	select {
+	case sig := <-sigCh:
+		gracefulStop(fmt.Sprintf("收到信号 %v", sig))
+	case <-shutdownCh:
+		gracefulStop("收到 shutdown 请求")
 	case err := <-errCh:
 		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[RPC] 服务异常退出: %v", err)

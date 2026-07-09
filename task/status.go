@@ -3,6 +3,7 @@ package task
 
 import (
 	"encoding/json"
+	"strconv"
 	"time"
 )
 
@@ -174,6 +175,24 @@ type ProgressFile struct {
 	CompletedSegments int64     `json:"completedSegments"`
 	BytesReceived     int64     `json:"bytesReceived"`
 	UpdatedAt         time.Time `json:"updatedAt"`
+}
+
+// ============================== 辅助 ==============================
+
+// toInt 从 interface{} 提取 int 值（支持 float64, json.Number, string）。
+func toInt(v interface{}) int {
+	switch val := v.(type) {
+	case float64:
+		return int(val)
+	case json.Number:
+		n, _ := val.Int64()
+		return int(n)
+	case string:
+		n, _ := strconv.Atoi(val)
+		return n
+	default:
+		return 0
+	}
 }
 
 // ============================== 时间 ==============================

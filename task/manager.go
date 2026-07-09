@@ -10,6 +10,9 @@ import (
 
 // ============================== Manager ==============================
 
+// ShutdownFunc 关闭回调函数类型（由 main 注入，RPC 触发时执行进程退出）。
+type ShutdownFunc func()
+
 // Manager 任务管理器
 type Manager struct {
 	tasks         map[string]*Task
@@ -20,18 +23,25 @@ type Manager struct {
 	stoppedList   []string // GID 列表 (已完成/失败/已删除，FIFO)
 	stoppedMax    int      // stoppedList 最大长度
 	defaultWorker int      // 单任务默认下载线程数
+	dir           string   // 全局默认下载目录（空=当前目录）
+
+	onShutdown ShutdownFunc // aria2.shutdown 回调
 
 	sessionFile string // 会话文件路径（空=不保存）
 }
 
 // NewManager 创建管理器
+// dir 为全局默认下载目录（空字符串 → 自动取 "."）。
 // sessionFile 为空时跳过会话持久化。
-func NewManager(maxConcurrent, defaultWorkers int, sessionFile string) *Manager {
+func NewManager(maxConcurrent, defaultWorkers int, dir, sessionFile string) *Manager {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 5
 	}
 	if defaultWorkers <= 0 {
 		defaultWorkers = 3
+	}
+	if dir == "" {
+		dir = "."
 	}
 	return &Manager{
 		tasks:         make(map[string]*Task),
@@ -39,6 +49,7 @@ func NewManager(maxConcurrent, defaultWorkers int, sessionFile string) *Manager 
 		activeLimit:   maxConcurrent,
 		stoppedMax:    1000,
 		defaultWorker: defaultWorkers,
+		dir:           dir,
 		sessionFile:   sessionFile,
 	}
 }
@@ -46,12 +57,31 @@ func NewManager(maxConcurrent, defaultWorkers int, sessionFile string) *Manager 
 // DefaultWorkers 返回单任务默认线程数
 func (m *Manager) DefaultWorkers() int { return m.defaultWorker }
 
+// ============================== 关闭回调 ==============================
+
+// SetShutdownCallback 注入关闭回调（由 main.go 调用）。
+func (m *Manager) SetShutdownCallback(fn ShutdownFunc) {
+	m.onShutdown = fn
+}
+
+// RequestShutdown 触发优雅关闭（aria2.shutdown RPC 调用）。
+func (m *Manager) RequestShutdown() {
+	if m.onShutdown != nil {
+		m.onShutdown()
+	}
+}
+
 // ============================== 任务操作 ==============================
 
 // AddURI 添加一个下载任务
 func (m *Manager) AddURI(url string, opts Options) (string, error) {
 	if url == "" {
 		return "", fmt.Errorf("URL is required")
+	}
+
+	// 未指定目录时使用全局默认目录
+	if opts.Dir == "" {
+		opts.Dir = m.dir
 	}
 
 	t := NewTask(url, opts, m.onTaskUpdate)
@@ -282,6 +312,114 @@ func (m *Manager) GlobalStat() GlobalStat {
 		NumStopped:      itoa(int64(stopped)),
 		NumStoppedTotal: itoa(int64(stopped)),
 	}
+}
+
+// ============================== 全局选项 ==============================
+
+// GlobalOption 返回当前全局配置（aria2.getGlobalOption 兼容）。
+func (m *Manager) GlobalOption() map[string]string {
+	m.mu.RLock()
+	limit := m.activeLimit
+	workers := m.defaultWorker
+	m.mu.RUnlock()
+	return map[string]string{
+		"max-concurrent-downloads":   itoa(int64(limit)),
+		"max-connection-per-server":  itoa(int64(workers)),
+		"split":                      itoa(int64(workers)),
+		"max-overall-download-limit": "0",
+		"dir":                        m.dir,
+	}
+}
+
+// ChangeGlobalOption 修改全局配置（aria2.changeGlobalOption 兼容）。
+func (m *Manager) ChangeGlobalOption(opts map[string]interface{}) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if v, ok := opts["max-concurrent-downloads"]; ok {
+		if n := toInt(v); n > 0 {
+			m.activeLimit = n
+		}
+	}
+	if v, ok := opts["max-connection-per-server"]; ok {
+		if n := toInt(v); n > 0 {
+			m.defaultWorker = n
+		}
+	}
+	if v, ok := opts["split"]; ok {
+		if n := toInt(v); n > 0 {
+			m.defaultWorker = n
+		}
+	}
+	if v, ok := opts["dir"]; ok {
+		if d, ok := v.(string); ok && d != "" {
+			m.dir = d
+		}
+	}
+	return nil
+}
+
+// PurgeDownloadResult 批量清除所有已完成/错误/已删除的任务记录。
+func (m *Manager) PurgeDownloadResult() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	toDelete := make([]string, 0)
+	for gid, t := range m.tasks {
+		s := t.Status()
+		if s == StatusComplete || s == StatusError || s == StatusRemoved {
+			toDelete = append(toDelete, gid)
+		}
+	}
+	for _, gid := range toDelete {
+		delete(m.tasks, gid)
+	}
+	// 清理 taskOrder
+	filtered := make([]string, 0, len(m.taskOrder))
+	for _, gid := range m.taskOrder {
+		if _, ok := m.tasks[gid]; ok {
+			filtered = append(filtered, gid)
+		}
+	}
+	m.taskOrder = filtered
+	m.stoppedList = m.stoppedList[:0]
+}
+
+// ============================== 单任务选项 / URI / Files ==============================
+
+// GetOption 返回单个任务的选项（aria2.getOption 兼容）。
+func (m *Manager) GetOption(gid string) (map[string]string, error) {
+	t, err := m.getTask(gid)
+	if err != nil {
+		return nil, err
+	}
+	return t.GetOption(), nil
+}
+
+// ChangeOption 修改单个任务的选项（aria2.changeOption 兼容）。
+func (m *Manager) ChangeOption(gid string, opts map[string]interface{}) error {
+	t, err := m.getTask(gid)
+	if err != nil {
+		return err
+	}
+	return t.ChangeOption(opts)
+}
+
+// GetUris 返回任务关联的 URI 列表（aria2.getUris 兼容）。
+func (m *Manager) GetUris(gid string) ([]URIInfo, error) {
+	t, err := m.getTask(gid)
+	if err != nil {
+		return nil, err
+	}
+	return t.GetUris(), nil
+}
+
+// GetFiles 返回任务的文件列表（aria2.getFiles 兼容）。
+func (m *Manager) GetFiles(gid string) ([]FileInfo, error) {
+	t, err := m.getTask(gid)
+	if err != nil {
+		return nil, err
+	}
+	return t.GetFiles(), nil
 }
 
 // ============================== 内部方法 ==============================
