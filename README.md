@@ -13,6 +13,7 @@ golang 多线程下载直播流 m3u8 视频，跨平台。支持 CLI 单任务�
 - **配置文件** — 支持 aria2 风格的 `key=value` 配置文件
 - **优雅关闭** — Ctrl+C 自动保存会话并释放端口
 - **已下载跳过** — 输出文件已存在时自动跳过，不消耗网络请求
+- **雪碧图生成** — `sprite` 子命令，从 m3u8 生成缩略图网格（需要 ffmpeg）
 
 ## 快速开始
 
@@ -20,32 +21,54 @@ golang 多线程下载直播流 m3u8 视频，跨平台。支持 CLI 单任务�
 
 ```powershell
 # 最简用法
-.\m3u8-downloader.exe -u=https://example.com/index.m3u8
+.\m3u8-downloader.exe -u https://example.com/index.m3u8
 
 # 完整参数
-.\m3u8-downloader.exe -u=https://example.com/index.m3u8 -o=myvideo -n=16 -ht=v2 -c="key=val"
+.\m3u8-downloader.exe -u https://example.com/index.m3u8 -o myvideo -n 16 --ht v2 -c "key=val"
 ```
 
 ### RPC Server 模式（AriaNg 面板）
 
 ```powershell
 # 启动服务
-.\m3u8-downloader.exe -rpc-listen-port=6800 -rpc-secret=your_token
+.\m3u8-downloader.exe --rpc-listen-port 6800 --rpc-secret your_token
 
 # 浏览器打开 AriaNg，连接到 http://127.0.0.1:6800/jsonrpc
 ```
 
-### 使用配置文件
+### 雪碧图模式（sprite 子命令）
+
+从 m3u8 视频流生成缩略图网格（雪碧图），需要系统安装 ffmpeg。
+程序根据 `rows × cols` 帧数和视频总时长自动计算采样间隔，均匀截取画面。
+未指定 `-o` 时自动从流的 PROGRAM-DATE-TIME 识别文件名。
 
 ```powershell
-# 复制示例配置
-copy m3u8.conf.example m3u8.conf
+# 基本用法：默认 5 列 x 4 行 = 20 帧，间隔自动计算
+.\m3u8-downloader.exe sprite -u https://example.com/index.m3u8
 
-# 编辑后启动
-.\m3u8-downloader.exe --conf-path=m3u8.conf
+# 自定义网格（8 列 x 6 行 = 48 帧）
+.\m3u8-downloader.exe sprite -u https://example.com/index.m3u8 --cols 8 --rows 6
 
-# CLI 参数可覆盖配置文件中的值
-.\m3u8-downloader.exe --conf-path=m3u8.conf -rpc-secret=override
+# 指定输出目录和文件名前缀
+.\m3u8-downloader.exe sprite -u https://example.com/index.m3u8 -o myvideo --sp D:\output
+
+# 自定义缩略图尺寸
+.\m3u8-downloader.exe sprite -u https://example.com/index.m3u8 -w 640 --height 360
+```
+
+输出文件为 `<前缀>.jpg`，例如 `sprite.jpg` 或自动命名的 `20260716_230000.jpg`。
+
+### 使用配置文件
+
+配置文件用于填写 Server 模式的启动参数，避免每次在命令行输入一长串选项。
+程序读取配置后，若 `rpc-listen-port` 非 0 则自动进入 Server 模式。
+
+```powershell
+# 通过配置文件启动 Server（配置文件中写好 rpc-listen-port、rpc-secret 等）
+.\m3u8-downloader.exe --conf-path m3u8.conf
+
+# 命令行参数优先级高于配置文件，可临时覆盖
+.\m3u8-downloader.exe --conf-path m3u8.conf --rpc-secret override
 ```
 
 ---
@@ -59,22 +82,40 @@ copy m3u8.conf.example m3u8.conf
 | `-u` | string | — | m3u8 下载地址 |
 | `-o` | string | `movie` | 输出文件名（不含扩展名） |
 | `-n` | int | 3 | 下载线程数 |
-| `-ht` | string | `v1` | host 拼接策略：`v1`=scheme://host+path目录，`v2`=scheme://host |
+| `--ht` | string | `v1` | host 拼接策略：`v1`=scheme://host+path目录，`v2`=scheme://host |
 | `-c` | string | — | 自定义 Cookie（格式：`key1=v1; key2=v2`） |
 | `-r` | bool | `true` | 完成后是否清除临时 ts 文件 |
 | `-s` | int | 0 | 跳过 HTTPS 证书校验（1=跳过） |
-| `-sp` | string | — | 文件保存路径（绝对路径，默认当前目录） |
+| `--sp` | string | — | 文件保存路径（绝对路径，默认当前目录） |
+| `--max-retry` | int | 5 | 单分片最大重试次数 |
+
+### sprite 子命令参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `-u` | string | — | m3u8 下载地址（必填） |
+| `--cols` | int | 5 | 雪碧图列数 |
+| `--rows` | int | 4 | 雪碧图行数 |
+| `-w` | int | 480 | 单张缩略图宽度（px） |
+| `--height` | int | 270 | 单张缩略图高度（px） |
+| `-o` | string | `sprite` | 输出文件名前缀（不指定则从流中自动识别） |
+| `--sp` | string | — | 输出目录（默认当前目录） |
+| `-n` | int | 3 | 下载线程数 |
+| `--ht` | string | `v1` | host 拼接策略 |
+| `-c` | string | — | 自定义 Cookie |
+| `-s` | int | 0 | 跳过 HTTPS 证书校验（1=跳过） |
+| `--max-retry` | int | 5 | 单分片最大重试次数 |
 
 ### RPC Server 模式参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `-rpc-listen-port` | int | 0 | RPC 监听端口（0=CLI模式，非0=Server模式） |
-| `-rpc-secret` | string | — | RPC 鉴权密钥（空=无鉴权，不推荐） |
-| `-rpc-listen-all` | bool | `false` | 监听所有网卡（`false` 仅监听 127.0.0.1） |
-| `-max-concurrent-downloads` | int | 1 | 最大同时下载任务数 |
-| `-session-file` | string | `m3u8.session` | 会话文件路径，重启后恢复未完成任务 |
-| `--conf-path` | string | — | 配置文件路径（key=value 格式） |
+| `--rpc-listen-port` | int | 0 | RPC 监听端口（0=CLI模式，非0=Server模式） |
+| `--rpc-secret` | string | — | RPC 鉴权密钥（空=无鉴权，不推荐） |
+| `--rpc-listen-all` | bool | `false` | 监听所有网卡（`false` 仅监听 127.0.0.1） |
+| `--max-concurrent-downloads` | int | 1 | 最大同时下载任务数 |
+| `--session-file` | string | `m3u8.session` | 会话文件路径，重启后恢复未完成任务 |
+| `--conf-path` | string | — | 配置文件路径（key=value 格式，用于配置 Server 模式参数） |
 
 ---
 
@@ -139,26 +180,26 @@ session-file=m3u8.session
 ```bash
 # Linux / macOS
 chmod 0755 m3u8-linux-amd64
-./m3u8-linux-amd64 -u=http://example.com/index.m3u8
+./m3u8-linux-amd64 -u http://example.com/index.m3u8
 
 # Windows
-.\m3u8-windows-amd64.exe -u=http://example.com/index.m3u8
+.\m3u8-windows-amd64.exe -u http://example.com/index.m3u8
 ```
 
 ### RPC Server 模式
 
 ```bash
 # 基础启动
-./m3u8-linux-amd64 -rpc-listen-port=6800 -rpc-secret=my_token
+./m3u8-linux-amd64 --rpc-listen-port 6800 --rpc-secret my_token
 
 # 外网访问 + 配置 + 多任务
 ./m3u8-linux-amd64 \
-  -rpc-listen-port=6800 \
-  -rpc-secret=my_token \
-  -rpc-listen-all=true \
-  -max-concurrent-downloads=5 \
-  -session-file=/data/m3u8.session \
-  --conf-path=/etc/m3u8.conf
+  --rpc-listen-port 6800 \
+  --rpc-secret my_token \
+  --rpc-listen-all \
+  --max-concurrent-downloads 5 \
+  --session-file /data/m3u8.session \
+  --conf-path /etc/m3u8.conf
 ```
 
 ### 配合 AriaNg
@@ -186,7 +227,8 @@ go build -o m3u8-downloader .
 
 ## 常见问题
 
-1. **下载失败** — 尝试切换 host 拼接策略：`-ht=v2`
+1. **下载失败** — 尝试切换 host 拼接策略：`--ht v2`
 2. **fMP4 流合并失败** — 需要安装 ffmpeg 并确保在 PATH 中
-3. **端口占用** — 程序退出后端口自动释放（已启用 SO_REUSEADDR）；如仍有占用，可使用 `netstat -ano | findstr :6800` 查找进程并终止
-4. **Linux/macOS 权限** — `chmod 0755 m3u8-linux-amd64`
+3. **雪碧图生成失败** — 同上，sprite 子命令也依赖 ffmpeg
+4. **端口占用** — 程序退出后端口自动释放（已启用 SO_REUSEADDR）；如仍有占用，可使用 `netstat -ano | findstr :6800` 查找进程并终止
+5. **Linux/macOS 权限** — `chmod 0755 m3u8-linux-amd64`

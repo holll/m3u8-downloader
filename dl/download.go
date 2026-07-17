@@ -20,7 +20,26 @@ import (
 
 // DownloadAll 并发下载所有切片
 func (d *Downloader) DownloadAll() {
-	d.progress = &ProgressTracker{total: int64(len(d.segments))}
+	d.downloadSegments(d.segments)
+}
+
+// DownloadSelected 并发下载指定索引的切片（索引为 Segment.Index 字段值）
+func (d *Downloader) DownloadSelected(indices []int) {
+	set := make(map[int]struct{}, len(indices))
+	for _, idx := range indices {
+		set[idx] = struct{}{}
+	}
+	var selected []Segment
+	for _, seg := range d.segments {
+		if _, ok := set[seg.Index]; ok {
+			selected = append(selected, seg)
+		}
+	}
+	d.downloadSegments(selected)
+}
+
+func (d *Downloader) downloadSegments(segs []Segment) {
+	d.progress = &ProgressTracker{total: int64(len(segs))}
 
 	var wg sync.WaitGroup
 	limiter := make(chan struct{}, d.maxWorkers)
@@ -42,7 +61,7 @@ func (d *Downloader) DownloadAll() {
 		defer func() { close(doneCh) }()
 	}
 
-	for i := range d.segments {
+	for i := range segs {
 		wg.Add(1)
 		limiter <- struct{}{}
 		go func(seg Segment) {
@@ -57,7 +76,7 @@ func (d *Downloader) DownloadAll() {
 				}
 			}
 			d.progress.Done()
-		}(d.segments[i])
+		}(segs[i])
 	}
 	wg.Wait()
 

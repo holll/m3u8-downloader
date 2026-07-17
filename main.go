@@ -6,7 +6,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,120 +17,150 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/urfave/cli/v2"
+
 	"m3u8-downloader/config"
 	"m3u8-downloader/dl"
 	"m3u8-downloader/rpc"
+	"m3u8-downloader/sprite"
 	"m3u8-downloader/task"
 	"m3u8-downloader/util"
 )
 
-// ============================== 命令行参数 ==============================
-
-var (
-	// CLI 模式
-	urlFlag  = flag.String("u", "", "m3u8下载地址(http(s)://url/xx/xx/index.m3u8)")
-	nFlag    = flag.Int("n", 3, "num:下载线程数(默认3)")
-	htFlag   = flag.String("ht", "v1", "hostType: v1/v2")
-	oFlag    = flag.String("o", "movie", "movieName:自定义文件名(默认为movie)")
-	cFlag    = flag.String("c", "", "cookie:自定义请求cookie")
-	rFlag    = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
-	sFlag    = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求")
-	spFlag   = flag.String("sp", "", "savePath:文件保存的绝对路径")
-	maxRetry = flag.Int("max-retry", 5, "单分片最大重试次数(默认5, 5次失败则任务失败)")
-
-	// RPC Server 模式
-	rpcPort     = flag.Int("rpc-listen-port", 0, "RPC监听端口(0=CLI模式, 非0=Server模式)")
-	rpcSecret   = flag.String("rpc-secret", "", "RPC鉴权token(空=无鉴权)")
-	rpcListen   = flag.Bool("rpc-listen-all", false, "监听所有网卡(默认仅localhost)")
-	maxDownload = flag.Int("max-concurrent-downloads", 1, "最大同时下载数(Server模式, 默认1)")
-	sessionFile = flag.String("session-file", "m3u8.session", "会话文件路径(保存未完成任务, 重启恢复)")
-	confPath    = flag.String("conf-path", "", "配置文件路径(key=value格式, CLI参数优先)")
-)
-
 func main() {
-	Run()
-}
+	app := &cli.App{
+		Name:  "m3u8-downloader",
+		Usage: "多线程下载直播流 m3u8 视频（支持 TS/fMP4、AES-128 解密、aria2 RPC）",
+		Flags: globalFlags(),
+		Action: func(c *cli.Context) error {
+			// 配置文件用于填写 Server 模式参数（如 rpc-listen-port 等）
+			loadConfig(c.String("conf-path"))
 
-// Run 主流程
-func Run() {
-	// 0. 从命令行参数中提前提取 --conf-path，加载配置文件
-	loadConfigFromArgs()
+			if c.Int("rpc-listen-port") != 0 {
+				runServer(c)
+			} else {
+				runCLI(c)
+			}
+			return nil
+		},
+		Commands: []*cli.Command{
+			spriteCommand(),
+		},
+	}
 
-	// 1. 解析命令行参数（CLI 参数优先级高于配置文件）
-	flag.Parse()
-
-	if *rpcPort != 0 {
-		runServer()
-	} else {
-		runCLI()
+	if err := app.Run(os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
 	}
 }
 
-// loadConfigFromArgs 从 os.Args 中提取 --conf-path，加载配置文件，
-// 并用配置项设置 flag 默认值（后续 flag.Parse() 会用 CLI 参数覆盖）。
-func loadConfigFromArgs() {
-	cfgPath := peekConfPath(os.Args[1:])
+// ============================== 全局参数 ==============================
+
+func globalFlags() []cli.Flag {
+	return []cli.Flag{
+		// CLI 模式
+		&cli.StringFlag{Name: "u", Usage: "m3u8 下载地址", EnvVars: []string{"M3U8_URL"}},
+		&cli.IntFlag{Name: "n", Value: 3, Usage: "下载线程数"},
+		&cli.StringFlag{Name: "ht", Value: "v1", Usage: "host 拼接策略: v1/v2"},
+		&cli.StringFlag{Name: "o", Value: "movie", Usage: "输出文件名（不含扩展名）"},
+		&cli.StringFlag{Name: "c", Usage: "自定义请求 Cookie"},
+		&cli.BoolFlag{Name: "r", Value: true, Usage: "完成后自动清除临时 ts 文件"},
+		&cli.IntFlag{Name: "s", Value: 0, Usage: "跳过 HTTPS 证书校验（1=跳过）"},
+		&cli.StringFlag{Name: "sp", Usage: "文件保存路径（绝对路径）"},
+		&cli.IntFlag{Name: "max-retry", Value: 5, Usage: "单分片最大重试次数"},
+		// RPC Server 模式
+		&cli.IntFlag{Name: "rpc-listen-port", Value: 0, Usage: "RPC 监听端口（0=CLI模式）"},
+		&cli.StringFlag{Name: "rpc-secret", Usage: "RPC 鉴权密钥"},
+		&cli.BoolFlag{Name: "rpc-listen-all", Usage: "监听所有网卡（默认仅 127.0.0.1）"},
+		&cli.IntFlag{Name: "max-concurrent-downloads", Value: 1, Usage: "最大同时下载任务数"},
+		&cli.StringFlag{Name: "session-file", Value: "m3u8.session", Usage: "会话文件路径"},
+		&cli.StringFlag{Name: "conf-path", Usage: "配置文件路径（key=value 格式，用于配置 Server 模式参数）"},
+	}
+}
+
+// ============================== sprite 子命令 ==============================
+
+func spriteCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "sprite",
+		Usage: "从 m3u8 生成雪碧图（缩略图网格）",
+		Flags: []cli.Flag{
+			&cli.StringFlag{Name: "u", Required: true, Usage: "m3u8 URL"},
+			&cli.IntFlag{Name: "cols", Value: 5, Usage: "雪碧图列数"},
+			&cli.IntFlag{Name: "rows", Value: 4, Usage: "雪碧图行数"},
+			&cli.IntFlag{Name: "w", Value: 480, Usage: "缩略图宽度 px"},
+			&cli.IntFlag{Name: "height", Value: 270, Usage: "缩略图高度 px"},
+			&cli.StringFlag{Name: "o", Value: "sprite", Usage: "输出文件名前缀"},
+			&cli.StringFlag{Name: "sp", Usage: "输出目录（默认当前目录）"},
+			&cli.IntFlag{Name: "n", Value: 3, Usage: "下载线程数"},
+			&cli.StringFlag{Name: "ht", Value: "v1", Usage: "hostType: v1/v2"},
+			&cli.StringFlag{Name: "c", Usage: "自定义请求 Cookie"},
+			&cli.IntFlag{Name: "s", Value: 0, Usage: "跳过 TLS 验证（1=跳过）"},
+			&cli.IntFlag{Name: "max-retry", Value: 5, Usage: "单分片最大重试次数"},
+		},
+		Action: func(c *cli.Context) error {
+			savePath := c.String("sp")
+			if savePath == "" {
+				savePath, _ = os.Getwd()
+			}
+			o := c.String("o")
+			return sprite.Run(sprite.Config{
+				URL:        c.String("u"),
+				OutPrefix:  o,
+				AutoName:   o == "sprite",
+				SavePath:   savePath,
+				HostType:   c.String("ht"),
+				Cookie:     c.String("c"),
+				Insecure:   c.Int("s") != 0,
+				Cols:       c.Int("cols"),
+				Rows:       c.Int("rows"),
+				ThumbW:     c.Int("w"),
+				ThumbH:     c.Int("height"),
+				MaxWorkers: c.Int("n"),
+				MaxRetry:   c.Int("max-retry"),
+			})
+		},
+	}
+}
+
+// ============================== 配置文件加载 ==============================
+
+func loadConfig(cfgPath string) {
 	if cfgPath == "" {
 		return
 	}
-
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		log.Printf("[config] 加载失败: %v", err)
 		return
 	}
-
+	// 将配置文件中的值设置为环境变量，urfave/cli 会通过 EnvVars 读取
+	// 对于没有 EnvVars 的 flag，通过 os.Args 注入不现实，保持兼容即可
 	for k, v := range cfg {
-		// 不覆盖已从环境变量或其他来源设置的值
-		if err := flag.Set(k, v); err != nil {
-			log.Printf("[config] 跳过未知配置项: %s=%s", k, v)
-		}
+		os.Setenv("M3U8_"+strings.ToUpper(strings.ReplaceAll(k, "-", "_")), v)
 	}
 	log.Printf("[config] 已从 %s 加载 %d 条配置", cfgPath, len(cfg))
 }
 
-// peekConfPath 从参数列表中提取 --conf-path 的值。
-// 支持 --conf-path=value 和 --conf-path value 两种格式。
-func peekConfPath(args []string) string {
-	for i, a := range args {
-		// --conf-path=value
-		if after, ok := strings.CutPrefix(a, "--conf-path="); ok {
-			return after
-		}
-		// --conf-path value
-		if a == "--conf-path" && i+1 < len(args) {
-			return args[i+1]
-		}
-		// -conf-path=value
-		if after, ok := strings.CutPrefix(a, "-conf-path="); ok {
-			return after
-		}
-		// -conf-path value
-		if a == "-conf-path" && i+1 < len(args) {
-			return args[i+1]
-		}
-	}
-	return ""
-}
-
 // ============================== CLI 模式 ==============================
 
-func runCLI() {
+func runCLI(c *cli.Context) {
 	fmt.Println("[功能]:多线程下载直播流m3u8视屏（支持 TS/fMP4）\n[提醒]:下载失败，请使用 -ht=v2\n[提醒]:fMP4 流需要 ffmpeg 进行合并\n[提醒]:进度条中途下载失败，可重复执行断点续传")
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	now := time.Now()
 
-	m3u8Url := *urlFlag
+	m3u8Url := c.String("u")
 	if !strings.HasPrefix(m3u8Url, "http") || m3u8Url == "" {
-		flag.Usage()
+		cli.ShowAppHelp(c)
 		return
 	}
 
 	pwd, _ := os.Getwd()
-	if *spFlag != "" {
-		pwd = *spFlag
+	if c.String("sp") != "" {
+		pwd = c.String("sp")
 	}
-	outputDir := filepath.Join(pwd, *oFlag)
+	oName := c.String("o")
+	outputDir := filepath.Join(pwd, oName)
 	if isExist, _ := util.PathExists(outputDir); !isExist {
 		if err := os.MkdirAll(outputDir, 0755); err != nil {
 			fmt.Printf("\n[Failed] 创建目录失败: %v\n", err)
@@ -142,13 +171,13 @@ func runCLI() {
 	d := dl.New(dl.Config{
 		M3U8URL:    m3u8Url,
 		OutputDir:  outputDir,
-		MaxWorkers: *nFlag,
-		HostType:   *htFlag,
-		AutoClear:  *rFlag,
-		AutoName:   *oFlag == "movie",
-		Cookie:     *cFlag,
-		Insecure:   *sFlag != 0,
-		MaxRetry:   *maxRetry,
+		MaxWorkers: c.Int("n"),
+		HostType:   c.String("ht"),
+		AutoClear:  c.Bool("r"),
+		AutoName:   oName == "movie",
+		Cookie:     c.String("c"),
+		Insecure:   c.Int("s") != 0,
+		MaxRetry:   c.Int("max-retry"),
 	})
 
 	if err := d.Parse(); err != nil {
@@ -185,28 +214,26 @@ func runCLI() {
 	}
 
 	util.DrawProgressBar("Merging", 1.0, dl.ProgressWidth, mv)
-	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", mv, time.Now().Sub(now).Seconds())
+	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", mv, time.Since(now).Seconds())
 }
 
 // ============================== RPC Server 模式 ==============================
 
-func runServer() {
-	// 全局默认下载目录：-sp 参数或当前目录
-	dir := *spFlag
+func runServer(c *cli.Context) {
+	dir := c.String("sp")
 	if dir == "" {
 		dir = "."
 	}
 
-	mgr := task.NewManager(*maxDownload, *nFlag, dir, *sessionFile)
+	sessionPath := c.String("session-file")
+	mgr := task.NewManager(c.Int("max-concurrent-downloads"), c.Int("n"), dir, sessionPath)
 
-	// 恢复上次未完成的任务
-	if *sessionFile != "" {
-		if err := mgr.LoadSession(*sessionFile); err != nil {
+	if sessionPath != "" {
+		if err := mgr.LoadSession(sessionPath); err != nil {
 			log.Printf("[session] 加载失败: %v", err)
 		}
 	}
 
-	// aria2.shutdown RPC 触发通道
 	shutdownCh := make(chan struct{})
 	mgr.SetShutdownCallback(func() {
 		select {
@@ -216,38 +243,35 @@ func runServer() {
 		}
 	})
 
-	addr := fmt.Sprintf("127.0.0.1:%d", *rpcPort)
-	if *rpcListen {
-		addr = fmt.Sprintf("0.0.0.0:%d", *rpcPort)
+	port := c.Int("rpc-listen-port")
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	if c.Bool("rpc-listen-all") {
+		addr = fmt.Sprintf("0.0.0.0:%d", port)
 	}
 
-	srv := rpc.NewServer(addr, mgr, *rpcSecret)
+	secret := c.String("rpc-secret")
+	srv := rpc.NewServer(addr, mgr, secret)
 	fmt.Printf("[RPC] 服务启动: http://%s/jsonrpc\n", addr)
-	if *rpcSecret != "" {
+	if secret != "" {
 		fmt.Println("[RPC] 鉴权已启用 (token:****)")
 	}
 	fmt.Println("[RPC] 使用 AriaNg 连接此地址即可管理下载任务")
 
-	// 信号处理：Ctrl+C 或 kill 时优雅关闭
-	// 注意：Windows 上 Ctrl+C 发送 os.Interrupt，而非 SIGINT
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	// 在 goroutine 中启动服务
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.Start()
 	}()
 
-	// 优雅关闭逻辑（复用）
 	gracefulStop := func(reason string) {
 		fmt.Printf("\n[RPC] %s，正在关闭...\n", reason)
 		srv.Stop()
-		<-errCh // 等待 Serve 返回
+		<-errCh
 
-		// 最终保存会话（同步，确保不丢数据）
-		if *sessionFile != "" {
-			if err := mgr.SaveSession(*sessionFile); err != nil {
+		if sessionPath != "" {
+			if err := mgr.SaveSession(sessionPath); err != nil {
 				log.Printf("[session] 保存失败: %v", err)
 			} else {
 				log.Println("[session] 会话已保存")
@@ -256,7 +280,6 @@ func runServer() {
 		fmt.Println("[RPC] 服务已停止")
 	}
 
-	// 等待信号、shutdown RPC 或启动错误
 	select {
 	case sig := <-sigCh:
 		gracefulStop(fmt.Sprintf("收到信号 %v", sig))

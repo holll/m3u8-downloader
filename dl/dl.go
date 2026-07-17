@@ -116,6 +116,13 @@ func (d *Downloader) SegmentTotal() int64 { return int64(len(d.segments)) }
 // SetOutputFile 覆盖输出文件路径 (供 RPC 模式按选项设置)
 func (d *Downloader) SetOutputFile(path string) { d.outputFile = path }
 
+// Segments 返回解析到的切片列表的只读副本
+func (d *Downloader) Segments() []Segment {
+	cp := make([]Segment, len(d.segments))
+	copy(cp, d.segments)
+	return cp
+}
+
 // AutoName 从流的 PROGRAM-DATE-TIME 元数据自动生成输出文件名。
 // baseDir 是最终输出文件所在的目录（通常为当前工作目录）。
 // 仅在 autoName 为 true 且解析到了有效时间戳时生效。
