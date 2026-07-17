@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 )
 
 // ============================== Manager ==============================
@@ -27,7 +28,9 @@ type Manager struct {
 
 	onShutdown ShutdownFunc // aria2.shutdown 回调
 
-	sessionFile string // 会话文件路径（空=不保存）
+	sessionFile string      // 会话文件路径（空=不保存）
+	saveTimer   *time.Timer // 防抖定时器
+	saveTimerMu sync.Mutex  // 保护 saveTimer
 }
 
 // NewManager 创建管理器
@@ -486,10 +489,21 @@ func (m *Manager) startTask(t *Task) {
 }
 
 func (m *Manager) onTaskUpdate() {
-	// 状态变更时异步保存会话
-	if m.sessionFile != "" {
-		go m.SaveSession(m.sessionFile)
+	// 防抖：最后一次状态变更 2 秒后才实际写入，避免高频更新启动大量 goroutine
+	if m.sessionFile == "" {
+		return
 	}
+	m.saveTimerMu.Lock()
+	if m.saveTimer != nil {
+		m.saveTimer.Reset(2 * time.Second)
+	} else {
+		m.saveTimer = time.AfterFunc(2*time.Second, func() {
+			if err := m.SaveSession(m.sessionFile); err != nil {
+				log.Printf("[session] save failed: %v", err)
+			}
+		})
+	}
+	m.saveTimerMu.Unlock()
 }
 
 func (m *Manager) pushStopped(gid string) {

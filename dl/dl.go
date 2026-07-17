@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"m3u8-downloader/util"
@@ -56,6 +57,10 @@ type Downloader struct {
 	// 回调 (供外部监下载进度)
 	onBytes    func(int64)
 	onProgress func(completed, total int64)
+
+	// key 缓存：URI → keyData，并发安全
+	keyCache   map[string][]byte
+	keyCacheMu sync.Mutex
 }
 
 // New 创建下载器实例
@@ -70,6 +75,7 @@ func New(cfg Config) *Downloader {
 		autoName:   cfg.AutoName,
 		quiet:      cfg.Quiet,
 		maxRetry:   cfg.MaxRetry,
+		keyCache:   make(map[string][]byte),
 	}
 	if d.maxRetry <= 0 {
 		d.maxRetry = 5
@@ -131,6 +137,7 @@ func (d *Downloader) AutoName(baseDir string) {
 // --- 请求初始化 ---
 
 func (d *Downloader) initRequestOptions(cookie string, insecure bool) {
+	referer, _ := util.GetHost(d.m3u8URL, "v2")
 	opts := &grequests.RequestOptions{
 		UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
 		RequestTimeout: 30 * time.Second,
@@ -139,7 +146,7 @@ func (d *Downloader) initRequestOptions(cookie string, insecure bool) {
 			"Accept":          "*/*",
 			"Accept-Encoding": "*",
 			"Accept-Language": "zh-CN,zh;q=0.9, en;q=0.8, de;q=0.7, *;q=0.5",
-			"Referer":         util.GetHost(d.m3u8URL, "v2"),
+			"Referer":         referer,
 		},
 	}
 	if insecure {

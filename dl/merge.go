@@ -79,8 +79,7 @@ func (d *Downloader) mergeTS() (string, error) {
 
 func (d *Downloader) mergeFmp4() (string, error) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		Log.Println("[warn] ffmpeg 未安装，降级为二进制拼接（fMP4 输出大概率损坏！）")
-		return d.mergeTS()
+		return "", fmt.Errorf("ffmpeg 未安装，无法合并 fMP4 流；请安装 ffmpeg 后重试")
 	}
 
 	files, err := filepath.Glob(filepath.Join(d.outputDir, "*.mp4"))
@@ -92,14 +91,50 @@ func (d *Downloader) mergeFmp4() (string, error) {
 	}
 	sort.Strings(files)
 
+	// 逐片校验，损坏分片尝试重新下载，最终无法修复的跳过
 	var segmentFiles []string
+	var skippedByIndex []int
 	for _, f := range files {
-		if !strings.HasPrefix(filepath.Base(f), "init_") {
+		base := filepath.Base(f)
+		if strings.HasPrefix(base, "init_") {
+			continue
+		}
+
+		if err := validateFmp4Segment(f); err != nil {
+			Log.Printf("[warn] merge: 分片 %s 校验失败: %v", base, err)
+
+			// 尝试重新下载
+			var segIdx int
+			if _, scanErr := fmt.Sscanf(base, "%05d.mp4", &segIdx); scanErr == nil && segIdx >= 0 && segIdx < len(d.segments) {
+				Log.Printf("[info] merge: 尝试重新下载分片 %d (%s)...", segIdx, base)
+				os.Remove(f)
+				if dlErr := d.downloadSegment(d.segments[segIdx]); dlErr != nil {
+					Log.Printf("[warn] merge: 重新下载分片 %d 失败: %v，跳过", segIdx, dlErr)
+					skippedByIndex = append(skippedByIndex, segIdx)
+					continue
+				}
+				// 重新下载后再校验
+				if vErr := validateFmp4Segment(f); vErr != nil {
+					Log.Printf("[warn] merge: 重新下载后分片 %d 仍无效: %v，跳过", segIdx, vErr)
+					skippedByIndex = append(skippedByIndex, segIdx)
+					continue
+				}
+				Log.Printf("[info] merge: 分片 %d 重新下载成功", segIdx)
+				segmentFiles = append(segmentFiles, f)
+			} else {
+				Log.Printf("[warn] merge: 无法定位分片 %s 的 segment 信息，跳过", base)
+			}
+		} else {
 			segmentFiles = append(segmentFiles, f)
 		}
 	}
+
+	if len(skippedByIndex) > 0 {
+		Log.Printf("[warn] merge: 共跳过 %d 个无法修复的损坏分片 (index: %v)，输出视频将缺少对应帧",
+			len(skippedByIndex), skippedByIndex)
+	}
 	if len(segmentFiles) == 0 {
-		return "", fmt.Errorf("no segment .mp4 files found (only init segments)")
+		return "", fmt.Errorf("no valid segment .mp4 files found (all segments corrupted)")
 	}
 
 	listPath := filepath.Join(d.outputDir, "concat_list.txt")

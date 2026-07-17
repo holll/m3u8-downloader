@@ -23,7 +23,11 @@ func (d *Downloader) Parse() error {
 		return fmt.Errorf("fetch m3u8: HTTP %d", resp.StatusCode)
 	}
 	d.m3u8Body = resp.String()
-	d.m3u8Host = util.GetHost(d.m3u8URL, d.hostType)
+	host, err := util.GetHost(d.m3u8URL, d.hostType)
+	if err != nil {
+		return fmt.Errorf("resolve m3u8 host: %w", err)
+	}
+	d.m3u8Host = host
 
 	if err := d.parseWithLib(); err != nil {
 		Log.Printf("[warn] 库解析失败，降级到手写解析: %v", err)

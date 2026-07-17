@@ -3,7 +3,6 @@ package util
 
 import (
 	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,18 +14,18 @@ import (
 // GetHost 从 m3u8 URL 提取基础路径
 // ht="v1" → scheme://host + path 目录
 // ht="v2" → scheme://host
-func GetHost(Url, ht string) string {
+func GetHost(Url, ht string) (string, error) {
 	u, err := url.Parse(Url)
 	if err != nil {
-		log.Fatal(err)
+		return "", fmt.Errorf("parse URL %q: %w", Url, err)
 	}
 	switch ht {
 	case "v1":
-		return u.Scheme + "://" + u.Host + filepath.Dir(u.EscapedPath())
+		return u.Scheme + "://" + u.Host + filepath.Dir(u.EscapedPath()), nil
 	case "v2":
-		return u.Scheme + "://" + u.Host
+		return u.Scheme + "://" + u.Host, nil
 	}
-	return ""
+	return "", nil
 }
 
 // ============================== 进度条 ==============================

@@ -220,8 +220,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if op == 9 { // ping → pong
+				// 未认证时不允许通过 ping 帧保持连接
+				if !authed {
+					log.Printf("[RPC-ws] ping before auth, closing")
+					return
+				}
 				writeWSFrame(conn, msg, 10) // pong
 				continue
+			}
+			// 未认证时收到非文本帧，关闭连接
+			if !authed {
+				log.Printf("[RPC-ws] non-text frame before auth (opcode=%d), closing", op)
+				return
 			}
 			log.Printf("[RPC-ws] ignoring opcode=%d len=%d", op, len(msg))
 			continue

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -74,10 +75,25 @@ func (d *Downloader) downloadSegment(seg Segment) error {
 	filePath := filepath.Join(d.outputDir, fmt.Sprintf("%05d%s", seg.Index, ext))
 
 	if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
-		if d.onProgress != nil {
-			d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
+		// fMP4: 已存在文件需校验完整性，损坏则删除并重新下载
+		if d.isFmp4 {
+			if err := validateFmp4Segment(filePath); err != nil {
+				Log.Printf("[warn] segment %d: existing file corrupted (%v), re-downloading", seg.Index, err)
+				os.Remove(filePath)
+				// 继续走下载流程（不 return）
+			} else {
+				if d.onProgress != nil {
+					d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
+				}
+				return nil
+			}
+		} else {
+			// TS: 简单跳过
+			if d.onProgress != nil {
+				d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
+			}
+			return nil
 		}
-		return nil
 	}
 
 	for attempt := 0; attempt <= d.maxRetry; attempt++ {
@@ -157,7 +173,19 @@ func (d *Downloader) downloadSingle(seg Segment, filePath string) error {
 		data = stripBeforeSyncByte(data)
 	}
 
-	return os.WriteFile(filePath, data, 0644)
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return err
+	}
+
+	// fMP4: 写入后校验 ISOBMFF 结构，防止截断/损坏数据驻留磁盘
+	if d.isFmp4 {
+		if err := validateFmp4Segment(filePath); err != nil {
+			os.Remove(filePath)
+			return fmt.Errorf("segment validation failed: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (d *Downloader) downloadInitSegment(m *MapInfo, filePath string) error {
@@ -176,6 +204,13 @@ func (d *Downloader) downloadInitSegment(m *MapInfo, filePath string) error {
 }
 
 func (d *Downloader) fetchKey(ki *KeyInfo) ([]byte, error) {
+	d.keyCacheMu.Lock()
+	if cached, ok := d.keyCache[ki.URI]; ok {
+		d.keyCacheMu.Unlock()
+		return cached, nil
+	}
+	d.keyCacheMu.Unlock()
+
 	resp, err := grequests.Get(ki.URI, d.reqOpts)
 	if err != nil {
 		return nil, err
@@ -187,6 +222,11 @@ func (d *Downloader) fetchKey(ki *KeyInfo) ([]byte, error) {
 	if len(keyData) != 16 {
 		return nil, fmt.Errorf("unexpected key length: %d (expected 16)", len(keyData))
 	}
+
+	d.keyCacheMu.Lock()
+	d.keyCache[ki.URI] = keyData
+	d.keyCacheMu.Unlock()
+
 	return keyData, nil
 }
 
@@ -196,4 +236,91 @@ func stripBeforeSyncByte(data []byte) []byte {
 		return data[idx:]
 	}
 	return data
+}
+
+// ============================== 分片校验 ==============================
+
+// validateFmp4Segment 校验 fMP4 分片的 ISOBMFF box 链完整性。
+// 遍历所有 box，检查每个 box 是否在文件范围内，用于检测截断或损坏。
+// 返回 nil 表示 box 链完整、所有 box 均不超出文件边界。
+func validateFmp4Segment(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	fileSize := fi.Size()
+	if fileSize < 8 {
+		return fmt.Errorf("file too small: %d bytes", fileSize)
+	}
+
+	// 合法的 ISOBMFF box 类型白名单
+	validTypes := map[string]bool{
+		"ftyp": true, "styp": true, "moof": true, "mdat": true,
+		"moov": true, "free": true, "skip": true, "sidx": true,
+		"ssix": true, "prft": true, "emsg": true, "uuid": true,
+	}
+
+	const maxBoxes = 10000 // 防死循环（正常 fMP4 分片只有 3~10 个 box）
+	offset := int64(0)
+
+	for i := 0; i < maxBoxes; i++ {
+		// 刚好到达文件末尾 → box 链完整
+		if offset >= fileSize {
+			return nil
+		}
+		// 剩余不足 8 字节 → 文件中间截断
+		if offset+8 > fileSize {
+			return fmt.Errorf("box #%d @ offset %d: incomplete header, only %d bytes remain (truncated mid-box)",
+				i, offset, fileSize-offset)
+		}
+
+		f.Seek(offset, io.SeekStart)
+		header := make([]byte, 8)
+		if _, err := io.ReadFull(f, header); err != nil {
+			return fmt.Errorf("box #%d @ offset %d: %w", i, offset, err)
+		}
+
+		size := binary.BigEndian.Uint32(header[0:4])
+		boxType := string(header[4:8])
+
+		// 第一个 box 类型必须合法
+		if i == 0 && !validTypes[boxType] {
+			return fmt.Errorf("unexpected box type %q (corrupted or encrypted)", boxType)
+		}
+
+		// size == 0: box 延伸到 EOF（合法终止）
+		if size == 0 {
+			return nil
+		}
+
+		// size == 1: 扩展 64-bit size
+		effectiveSize := int64(size)
+		if size == 1 {
+			if offset+16 > fileSize {
+				return fmt.Errorf("box #%d @ offset %d: extended-size header truncated", i, offset)
+			}
+			ext := make([]byte, 8)
+			if _, err := io.ReadFull(f, ext); err != nil {
+				return fmt.Errorf("box #%d @ offset %d: %w", i, offset, err)
+			}
+			effectiveSize = int64(binary.BigEndian.Uint64(ext))
+		}
+
+		// 检查 box 是否超出文件范围
+		nextOffset := offset + effectiveSize
+		if nextOffset > fileSize {
+			return fmt.Errorf("box #%d @ offset %d type=%q: declares %d bytes but only %d remain (truncated)",
+				i, offset, boxType, effectiveSize, fileSize-offset)
+		}
+
+		offset = nextOffset
+	}
+
+	return fmt.Errorf("too many boxes (>%d), likely corrupted", maxBoxes)
 }
