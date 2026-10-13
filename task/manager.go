@@ -7,9 +7,15 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"m3u8-downloader/dl"
 )
 
 // ============================== Manager ==============================
+
+// DefaultMaxWorkers 单任务默认下载线程数，与 dl 包的默认并发保持一致。
+// 实测依据见 dl.DefaultMaxWorkers 的注释。
+const DefaultMaxWorkers = dl.DefaultMaxWorkers
 
 // ShutdownFunc 关闭回调函数类型（由 main 注入，RPC 触发时执行进程退出）。
 type ShutdownFunc func()
@@ -28,6 +34,8 @@ type Manager struct {
 
 	onShutdown ShutdownFunc // aria2.shutdown 回调
 
+	eventFn func(method, gid string) // 状态迁移事件回调（推送 aria2 通知）
+
 	sessionFile string      // 会话文件路径（空=不保存）
 	saveTimer   *time.Timer // 防抖定时器
 	saveTimerMu sync.Mutex  // 保护 saveTimer
@@ -41,7 +49,7 @@ func NewManager(maxConcurrent, defaultWorkers int, dir, sessionFile string) *Man
 		maxConcurrent = 5
 	}
 	if defaultWorkers <= 0 {
-		defaultWorkers = 3
+		defaultWorkers = DefaultMaxWorkers
 	}
 	if dir == "" {
 		dir = "."
@@ -94,19 +102,33 @@ func (m *Manager) AddURI(url string, opts Options) (string, error) {
 	m.taskOrder = append(m.taskOrder, t.GID)
 	m.mu.Unlock()
 
+	// aria2 兼容：options.pause=true 时任务入队即暂停，等待 unpause 才启动
+	if opts.Pause {
+		_ = t.Pause()
+		return t.GID, nil
+	}
+
 	// 尝试立即启动
 	m.tryStartTask(t)
 	return t.GID, nil
 }
 
 // Remove 移除任务
+// 与 aria2 一致：仅 active/waiting/paused 任务可被移除；已停止（完成/失败/已移除）
+// 的任务返回错误（对应 aria2 的 "Active Download not found for GID#..."），
+// 避免重复写入 stoppedList 造成列表重复项。
 func (m *Manager) Remove(gid string) error {
 	t, err := m.getTask(gid)
 	if err != nil {
 		return err
 	}
 
-	wasActive := t.Status() == StatusActive
+	s := t.Status()
+	if s != StatusActive && s != StatusWaiting && s != StatusPaused {
+		return fmt.Errorf("Active Download not found for GID#%s", gid)
+	}
+
+	wasActive := s == StatusActive
 	t.Remove()
 
 	if wasActive {
@@ -133,14 +155,20 @@ func (m *Manager) RemoveDownloadResult(gid string) error {
 	}
 	m.mu.Lock()
 	delete(m.tasks, gid)
-	for i, id := range m.taskOrder {
-		if id == gid {
-			m.taskOrder = append(m.taskOrder[:i], m.taskOrder[i+1:]...)
-			break
-		}
-	}
+	m.taskOrder = removeGID(m.taskOrder, gid)
+	m.stoppedList = removeGID(m.stoppedList, gid)
 	m.mu.Unlock()
 	return nil
+}
+
+// removeGID 从 GID 列表中移除指定项（保持其余元素顺序）。
+func removeGID(list []string, gid string) []string {
+	for i, id := range list {
+		if id == gid {
+			return append(list[:i], list[i+1:]...)
+		}
+	}
+	return list
 }
 
 // Pause 暂停任务
@@ -171,17 +199,29 @@ func (m *Manager) Unpause(gid string) error {
 	return nil
 }
 
-// PauseAll 暂停所有活跃任务
+// PauseAll 暂停所有任务（aria2 的 pauseAll 同时暂停 active 与 waiting 队列）。
+// 先暂停 waiting 队列，避免暂停 active 释放槽位后 tryStartNext 又启动新任务。
 func (m *Manager) PauseAll() {
 	m.mu.RLock()
+	waiting := make([]*Task, 0)
 	active := make([]*Task, 0)
 	for _, gid := range m.taskOrder {
-		if t, ok := m.tasks[gid]; ok && t.Status() == StatusActive {
+		t, ok := m.tasks[gid]
+		if !ok {
+			continue
+		}
+		switch t.Status() {
+		case StatusWaiting:
+			waiting = append(waiting, t)
+		case StatusActive:
 			active = append(active, t)
 		}
 	}
 	m.mu.RUnlock()
 
+	for _, t := range waiting {
+		m.Pause(t.GID)
+	}
 	for _, t := range active {
 		m.Pause(t.GID)
 	}
@@ -219,68 +259,97 @@ func (m *Manager) TellActive() []TaskStatus {
 	return m.collect(StatusActive)
 }
 
+// paginate 复刻 aria2 AbstractPaginationRpcMethod::getPaginationRange 的分页语义。
+// offset < 0 表示从队尾倒数；此时返回的切片在调用方需逆序（aria2 会 reverse）。
+// num <= 0 返回空（与 aria2 IntegerGE(0) + num<=0 → empty 一致）。
+func (m *Manager) paginate(total, offset, num int) (start, end int, reversed bool) {
+	if num <= 0 {
+		return 0, 0, false
+	}
+	if offset < 0 {
+		tempoffset := offset + total
+		if tempoffset < 0 {
+			return 0, 0, false
+		}
+		start = tempoffset - (num - 1)
+		if start < 0 {
+			start = 0
+			num = tempoffset + 1
+		}
+		end = start + num
+		if end > total {
+			end = total
+		}
+		return start, end, true
+	}
+	if total <= offset {
+		return 0, 0, false
+	}
+	end = offset + num
+	if end > total {
+		end = total
+	}
+	return offset, end, false
+}
+
 // TellWaiting 等待队列（aria2 兼容：包含 waiting 和 paused 任务）
 func (m *Manager) TellWaiting(offset, num int) []TaskStatus {
 	// 先 waiting 后 paused，保持插入顺序
 	all := m.collect(StatusWaiting)
 	all = append(all, m.collect(StatusPaused)...)
 	total := len(all)
+	// aria2 对空结果返回 []（JSON 数组），而非 null
 	if total == 0 {
-		return nil
+		return []TaskStatus{}
 	}
-	if offset < 0 {
-		offset = total + offset
-		if offset < 0 {
-			offset = 0
+	start, end, reversed := m.paginate(total, offset, num)
+	if start >= end {
+		return []TaskStatus{}
+	}
+	result := make([]TaskStatus, 0, end-start)
+	if reversed {
+		for i := end - 1; i >= start; i-- {
+			result = append(result, all[i])
 		}
+	} else {
+		result = append(result, all[start:end]...)
 	}
-	if offset >= total {
-		return nil
-	}
-	if num <= 0 {
-		num = total
-	}
-	end := offset + num
-	if end > total {
-		end = total
-	}
-	return all[offset:end]
+	return result
 }
 
-// TellStopped 已完成/失败/已删除列表
+// TellStopped 已完成/失败/已删除列表。
+// 顺序与 aria2 一致：offset<0 时从队尾倒数取 num 条并逆序返回（最新完成在前）。
 func (m *Manager) TellStopped(offset, num int) []TaskStatus {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	// 边界保护：aria2 用 -1 表示 "最后 num 条"
 	total := len(m.stoppedList)
+	// aria2 对空结果返回 []（JSON 数组），而非 null
 	if total == 0 {
-		return nil
+		m.mu.RUnlock()
+		return []TaskStatus{}
 	}
-	if offset < 0 {
-		offset = total + offset
-		if offset < 0 {
-			offset = 0
-		}
-	}
-	if offset >= total {
-		return nil
-	}
-	if num <= 0 {
-		num = total
-	}
-	end := offset + num
-	if end > total {
-		end = total
+	start, end, reversed := m.paginate(total, offset, num)
+	if start >= end {
+		m.mu.RUnlock()
+		return []TaskStatus{}
 	}
 
-	result := make([]TaskStatus, 0, end-offset)
-	for i := offset; i < end; i++ {
-		gid := m.stoppedList[i]
-		if t, ok := m.tasks[gid]; ok {
-			result = append(result, t.Snapshot())
+	result := make([]TaskStatus, 0, end-start)
+	if reversed {
+		for i := end - 1; i >= start; i-- {
+			gid := m.stoppedList[i]
+			if t, ok := m.tasks[gid]; ok {
+				result = append(result, t.Snapshot())
+			}
+		}
+	} else {
+		for i := start; i < end; i++ {
+			gid := m.stoppedList[i]
+			if t, ok := m.tasks[gid]; ok {
+				result = append(result, t.Snapshot())
+			}
 		}
 	}
+	m.mu.RUnlock()
 	return result
 }
 
@@ -425,6 +494,142 @@ func (m *Manager) GetFiles(gid string) ([]FileInfo, error) {
 	return t.GetFiles(), nil
 }
 
+// ChangeUri 增减任务关联的 URI（aria2.changeUri 兼容）。
+// 本实现仅支持单文件（fileIndex==1）的 m3u8 下载，返回实际删除/新增数量。
+func (m *Manager) ChangeUri(gid string, fileIndex int, delUris, addUris []string) (int, int, error) {
+	if fileIndex != 1 {
+		return 0, 0, fmt.Errorf("fileIndex is out of range")
+	}
+	t, err := m.getTask(gid)
+	if err != nil {
+		return 0, 0, err
+	}
+	return t.ChangeUri(delUris, addUris)
+}
+
+// GetPeers 返回任务的 BT peer 列表（aria2.getPeers 兼容）。
+// 与 aria2 一致：任务存在时返回空列表（非 BT 任务无 peer）；任务不存在返回错误。
+func (m *Manager) GetPeers(gid string) ([]interface{}, error) {
+	if _, err := m.getTask(gid); err != nil {
+		return nil, err
+	}
+	return []interface{}{}, nil
+}
+
+// GetServers 返回任务各文件的服务器连接信息（aria2.getServers 兼容）。
+// 与 aria2 一致：仅 active 状态返回，否则返回错误。
+// m3u8 下载由池化连接驱动，无法枚举每个镜像的独立连接，故 servers 为空数组。
+func (m *Manager) GetServers(gid string) ([]ServersFileInfo, error) {
+	t, err := m.getTask(gid)
+	if err != nil {
+		return nil, err
+	}
+	if t.Status() != StatusActive {
+		return nil, fmt.Errorf("no active download for GID#%s", gid)
+	}
+	return []ServersFileInfo{{
+		Index:   "1",
+		Servers: []ServerInfo{},
+	}}, nil
+}
+
+// ChangePosition 调整 waiting/paused 任务在等待队列中的位置（aria2.changePosition 兼容）。
+// how ∈ POS_SET（绝对位置）/ POS_CUR（相对当前位置）/ POS_END（相对队尾，pos 通常为负数）。
+// 返回移动后的新位置（0 基）。
+func (m *Manager) ChangePosition(gid string, pos int, how string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t, ok := m.tasks[gid]
+	if !ok {
+		return 0, fmt.Errorf("task not found: %s", gid)
+	}
+	s := t.Status()
+	if s != StatusWaiting && s != StatusPaused {
+		return 0, fmt.Errorf("cannot change position: download %s is not in waiting/paused queue (status: %s)", gid, s)
+	}
+
+	// 收集 waiting+paused 的 GID 序列（按 taskOrder 保序）
+	queue := make([]string, 0, len(m.taskOrder))
+	for _, id := range m.taskOrder {
+		if tt, ok := m.tasks[id]; ok {
+			ss := tt.Status()
+			if ss == StatusWaiting || ss == StatusPaused {
+				queue = append(queue, id)
+			}
+		}
+	}
+	total := len(queue)
+	if total == 0 {
+		return 0, fmt.Errorf("waiting queue is empty")
+	}
+
+	cur := -1
+	for i, id := range queue {
+		if id == gid {
+			cur = i
+			break
+		}
+	}
+	if cur < 0 {
+		return 0, fmt.Errorf("GID#%s not found in the waiting queue", gid)
+	}
+
+	// 目标位置计算（与 aria2 IndexedList::move 边界语义一致）
+	last := total - 1
+	var dest int
+	switch how {
+	case "POS_SET":
+		dest = pos
+		if dest > last {
+			dest = last
+		}
+	case "POS_CUR":
+		dest = cur + pos
+		if pos > 0 {
+			if dest > last {
+				dest = last
+			}
+		} else if dest < 0 {
+			dest = 0
+		}
+	case "POS_END":
+		dest = last + pos
+		if dest > last {
+			dest = last
+		}
+	default:
+		return 0, fmt.Errorf("illegal how: %s", how)
+	}
+	if dest < 0 {
+		dest = 0
+	}
+	if dest == cur {
+		return dest, nil
+	}
+
+	// 从队列移除 gid 再插入 dest
+	seq := make([]string, 0, total)
+	seq = append(seq, queue[:cur]...)
+	seq = append(seq, queue[cur+1:]...)
+	seq = append(seq, "") // 扩容 1 格
+	copy(seq[dest+1:], seq[dest:])
+	seq[dest] = gid
+
+	// 将新序列回写 taskOrder（仅替换 waiting/paused 槽位，其它任务原位不动）
+	j := 0
+	for i, id := range m.taskOrder {
+		if tt, ok := m.tasks[id]; ok {
+			ss := tt.Status()
+			if ss == StatusWaiting || ss == StatusPaused {
+				m.taskOrder[i] = seq[j]
+				j++
+			}
+		}
+	}
+	return dest, nil
+}
+
 // ============================== 内部方法 ==============================
 
 func (m *Manager) getTask(gid string) (*Task, error) {
@@ -488,7 +693,47 @@ func (m *Manager) startTask(t *Task) {
 	})
 }
 
-func (m *Manager) onTaskUpdate() {
+// SetEventCallback 注册状态迁移事件回调（由 RPC 层注入，用于推送 aria2 通知）。
+func (m *Manager) SetEventCallback(fn func(method, gid string)) {
+	m.mu.Lock()
+	m.eventFn = fn
+	m.mu.Unlock()
+}
+
+// aria2Event 返回状态迁移对应的 aria2 通知方法名；无对应事件时返回空串。
+// 映射依据 aria2 手册 Notifications 一节的语义。
+func aria2Event(prev, next Status) string {
+	switch next {
+	case StatusActive:
+		// 只有从等待队列进入下载才算「开始」，恢复下载不重复通知
+		if prev == StatusWaiting {
+			return "aria2.onDownloadStart"
+		}
+	case StatusPaused:
+		if prev == StatusActive || prev == StatusWaiting {
+			return "aria2.onDownloadPause"
+		}
+	case StatusRemoved:
+		return "aria2.onDownloadStop"
+	case StatusComplete:
+		return "aria2.onDownloadComplete"
+	case StatusError:
+		return "aria2.onDownloadError"
+	}
+	return ""
+}
+
+func (m *Manager) onTaskUpdate(gid string, prev, next Status) {
+	// 推送 aria2 通知（无 WS 连接时 Notify 自身为空操作）
+	if method := aria2Event(prev, next); method != "" {
+		m.mu.RLock()
+		fn := m.eventFn
+		m.mu.RUnlock()
+		if fn != nil {
+			fn(method, gid)
+		}
+	}
+
 	// 防抖：最后一次状态变更 2 秒后才实际写入，避免高频更新启动大量 goroutine
 	if m.sessionFile == "" {
 		return
@@ -509,6 +754,12 @@ func (m *Manager) onTaskUpdate() {
 func (m *Manager) pushStopped(gid string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// 去重：同一 GID 只应在 stoppedList 中出现一次，否则 tellStopped 会返回重复项
+	for _, id := range m.stoppedList {
+		if id == gid {
+			return
+		}
+	}
 	m.stoppedList = append(m.stoppedList, gid)
 	if len(m.stoppedList) > m.stoppedMax {
 		m.stoppedList = m.stoppedList[len(m.stoppedList)-m.stoppedMax:]
@@ -528,6 +779,19 @@ func (m *Manager) collect(status Status) []TaskStatus {
 }
 
 // ============================== 会话持久化 ==============================
+
+// SaveSessionNow 立即将会话保存到配置的会话文件（aria2.saveSession 兼容）。
+// 未配置 session-file 时返回错误（与 aria2 的 "Filename is not given." 一致）。
+func (m *Manager) SaveSessionNow() error {
+	m.mu.RLock()
+	sf := m.sessionFile
+	m.mu.RUnlock()
+	if sf == "" {
+		// 与 aria2 的 SaveSessionRpcMethod 文案保持一致
+		return fmt.Errorf("Filename is not given.")
+	}
+	return m.SaveSession(sf)
+}
 
 // SaveSession 将当前活跃/等待/暂停任务写入会话文件。
 // 使用原子写入（tmp + rename），并发安全。

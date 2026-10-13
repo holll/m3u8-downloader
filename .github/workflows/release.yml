@@ -5,15 +5,18 @@ on:
     tags:
       - "*"
 
+permissions:
+  contents: write
+
 env:
-  GO_VERSION: 1.17
-  CGO_ENABLED: 0
-  GO111MODULE: on
+  GO_VERSION: "1.25"
+  CGO_ENABLED: "0"
 
 jobs:
   build:
-    name: Build
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ linux, windows, darwin ]
         arch: [ amd64, arm64, 386 ]
@@ -38,18 +41,27 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: ${{ env.GO_VERSION }}
+        cache: true
 
     - name: Get dependencies
-      run: |
-        go mod download
+      run: go mod download
+
+    - name: Unit tests
+      run: go test ./...
 
     - name: Build binary
       run: |
-        GOOS=${GOOS} GOARCH=${GOARCH} go build  -o ./Releases/m3u8-${GOOS}-${GOARCH}${FILEEXTENSION} m3u8-downloader.go
+        mkdir -p ./Releases
+        go build -trimpath -ldflags "-s -w" \
+          -o ./Releases/m3u8-${GOOS}-${GOARCH}${FILEEXTENSION} .
+
+    - name: Checksums
+      run: |
+        cd ./Releases
+        sha256sum m3u8-* > SHA256SUMS.txt
 
     - name: Release
       uses: softprops/action-gh-release@v2
-      if: startsWith(github.ref, 'refs/tags/')
       with:
         files: |
           ./Releases/*

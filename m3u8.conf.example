@@ -57,3 +57,10 @@ sp=
 # 类型: int  默认: 5
 max-retry=5
 
+# 下载代理。设置后会覆盖 HTTP_PROXY / HTTPS_PROXY 环境变量，
+# 并对 CLI 模式与 RPC 模式（含动态创建的任务）同时生效。
+# 留空则不走代理；此时仍可用 HTTPS_PROXY 环境变量或 start.bat 的代理开关。
+# 仅支持 http/https 代理，不支持 socks5。
+# 类型: string  默认: ""（不使用代理）
+proxy=
+

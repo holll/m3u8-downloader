@@ -15,6 +15,12 @@ import (
 const (
 	DefaultTimeout = 30e9 // 30s (nanoseconds, 供外部使用)
 	ProgressWidth  = 20
+
+	// DefaultMaxWorkers 默认分片下载并发数。
+	// 实测（Cloudflare CDN + 高 RTT 国际链路，96 分片长任务）：单连接吞吐仅
+	// 100~330 KB/s，3→8 并发吞吐提升约 2~3 倍；但单 IP 总带宽约 2 MB/s 封顶，
+	// 并发再往上反而因连接争抢变慢（8→16：2170 → 1561 KB/s），故默认取 8。
+	DefaultMaxWorkers = 8
 )
 
 // ============================== 导出类型 ==============================

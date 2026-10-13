@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
+	"path"
 	"strings"
 )
 
@@ -21,7 +21,9 @@ func GetHost(Url, ht string) (string, error) {
 	}
 	switch ht {
 	case "v1":
-		return u.Scheme + "://" + u.Host + filepath.Dir(u.EscapedPath()), nil
+		// 用 path.Dir（正斜杠）而非 filepath.Dir，避免 Windows 下返回反斜杠目录
+		// 导致拼接出的分片 URL 含 "\" 而请求失败。
+		return u.Scheme + "://" + u.Host + path.Dir(u.EscapedPath()), nil
 	case "v2":
 		return u.Scheme + "://" + u.Host, nil
 	}

@@ -20,7 +20,7 @@ func (d *Downloader) Parse() error {
 		return fmt.Errorf("fetch m3u8: %w", err)
 	}
 	if !resp.Ok {
-		return fmt.Errorf("fetch m3u8: HTTP %d", resp.StatusCode)
+		return fmt.Errorf("fetch m3u8: %w", newHTTPStatusError(resp.StatusCode, d.m3u8URL))
 	}
 	d.m3u8Body = resp.String()
 	host, err := util.GetHost(d.m3u8URL, d.hostType)
@@ -191,5 +191,7 @@ func (d *Downloader) resolveURL(raw string) string {
 	if strings.HasPrefix(raw, "http") {
 		return raw
 	}
-	return fmt.Sprintf("%s/%s", d.m3u8Host, strings.TrimPrefix(raw, "/"))
+	// m3u8 位于域名根路径时 GetHost 返回的 host 以 "/" 结尾（path.Dir("/a.m3u8") == "/"），
+	// 直接拼接会得到 "//seg.ts" 这种双斜杠 URL，部分 CDN/nginx 会因此 404。
+	return fmt.Sprintf("%s/%s", strings.TrimSuffix(d.m3u8Host, "/"), strings.TrimPrefix(raw, "/"))
 }

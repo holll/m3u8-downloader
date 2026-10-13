@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"m3u8-downloader/crypto"
@@ -21,6 +21,28 @@ import (
 // DownloadAll 并发下载所有切片
 func (d *Downloader) DownloadAll() {
 	d.downloadSegments(d.segments)
+}
+
+// setSegmentError 记录首个分片失败原因（仅首次生效，并发安全）。
+func (d *Downloader) setSegmentError(err error) {
+	d.segErrOnce.Do(func() { d.segErr = err })
+}
+
+// SegmentError 返回本次下载中首个分片失败原因，全部分片成功时为 nil。
+//
+// DownloadAll 不返回错误以保持既有调用签名；分片失败若被忽略，Merge 只会
+// 把现存分片拼接起来并报成功，产出缺少片段的视频，因此失败原因必须外传，
+// 由上层决定是否终止任务。
+func (d *Downloader) SegmentError() error { return d.segErr }
+
+// notifySegmentDone 通知外部该切片已就绪（新下载或断点续传时已存在）。
+func (d *Downloader) notifySegmentDone(seg Segment) {
+	if d.onSegmentDone != nil {
+		d.onSegmentDone(seg.Index)
+	}
+	if d.onProgress != nil {
+		d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
+	}
 }
 
 // DownloadSelected 并发下载指定索引的切片（索引为 Segment.Index 字段值）
@@ -40,6 +62,9 @@ func (d *Downloader) DownloadSelected(indices []int) {
 
 func (d *Downloader) downloadSegments(segs []Segment) {
 	d.progress = &ProgressTracker{total: int64(len(segs))}
+	// 每次下载重置失败记录（本方法可能被 DownloadAll / DownloadSelected 复用同一实例）
+	d.segErrOnce = sync.Once{}
+	d.segErr = nil
 
 	var wg sync.WaitGroup
 	limiter := make(chan struct{}, d.maxWorkers)
@@ -69,8 +94,12 @@ func (d *Downloader) downloadSegments(segs []Segment) {
 				wg.Done()
 				<-limiter
 			}()
+			atomic.AddInt64(&d.inflight, 1)
+			defer atomic.AddInt64(&d.inflight, -1)
+
 			if err := d.downloadSegment(seg); err != nil {
 				d.progress.Fail()
+				d.setSegmentError(err)
 				if !d.quiet {
 					Log.Printf("[warn] segment %d failed: %v", seg.Index, err)
 				}
@@ -101,19 +130,18 @@ func (d *Downloader) downloadSegment(seg Segment) error {
 				os.Remove(filePath)
 				// 继续走下载流程（不 return）
 			} else {
-				if d.onProgress != nil {
-					d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
-				}
+				d.notifySegmentDone(seg)
 				return nil
 			}
 		} else {
 			// TS: 简单跳过
-			if d.onProgress != nil {
-				d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
-			}
+			d.notifySegmentDone(seg)
 			return nil
 		}
 	}
+
+	// 保留最后一次失败原因，供上层分类为 aria2 errorCode（HTTP 404 / 网络问题等）
+	var lastErr error
 
 	for attempt := 0; attempt <= d.maxRetry; attempt++ {
 		// 退避延迟：500ms→1s→1.5s→...封顶30s
@@ -130,6 +158,7 @@ func (d *Downloader) downloadSegment(seg Segment) error {
 			initPath := filepath.Join(d.outputDir, fmt.Sprintf("init_%05d.mp4", seg.Index))
 			if _, err := os.Stat(initPath); os.IsNotExist(err) {
 				if err := d.downloadInitSegment(seg.Map, initPath); err != nil {
+					lastErr = fmt.Errorf("init segment: %w", err)
 					continue
 				}
 			}
@@ -138,11 +167,14 @@ func (d *Downloader) downloadSegment(seg Segment) error {
 		// 下载切片主体
 		err := d.downloadSingle(seg, filePath)
 		if err == nil {
-			if d.onProgress != nil {
-				d.onProgress(int64(seg.Index+1), int64(len(d.segments)))
-			}
+			d.notifySegmentDone(seg)
 			return nil
 		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("segment %d failed after %d retries: %w", seg.Index, d.maxRetry+1, lastErr)
 	}
 	return fmt.Errorf("segment %d failed after %d retries", seg.Index, d.maxRetry+1)
 }
@@ -153,7 +185,7 @@ func (d *Downloader) downloadSingle(seg Segment, filePath string) error {
 		return err
 	}
 	if !resp.Ok {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return newHTTPStatusError(resp.StatusCode, seg.URL)
 	}
 
 	data := resp.Bytes()
@@ -192,16 +224,16 @@ func (d *Downloader) downloadSingle(seg Segment, filePath string) error {
 		data = stripBeforeSyncByte(data)
 	}
 
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
-		return err
-	}
-
-	// fMP4: 写入后校验 ISOBMFF 结构，防止截断/损坏数据驻留磁盘
+	// fMP4: 写盘前直接校验内存中的 ISOBMFF box 链，避免截断/损坏数据落盘。
+	// 校验失败时无需删文件，也省去写盘后二次 open 读校验的开销（分片量大时显著）。
 	if d.isFmp4 {
-		if err := validateFmp4Segment(filePath); err != nil {
-			os.Remove(filePath)
+		if err := validateFmp4Data(data); err != nil {
 			return fmt.Errorf("segment validation failed: %w", err)
 		}
+	}
+
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return err
 	}
 
 	return nil
@@ -213,7 +245,7 @@ func (d *Downloader) downloadInitSegment(m *MapInfo, filePath string) error {
 		return err
 	}
 	if !resp.Ok {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return newHTTPStatusError(resp.StatusCode, m.URI)
 	}
 	data := resp.Bytes()
 	if m.Limit > 0 && m.Offset+m.Limit <= int64(len(data)) {
@@ -235,7 +267,7 @@ func (d *Downloader) fetchKey(ki *KeyInfo) ([]byte, error) {
 		return nil, err
 	}
 	if !resp.Ok {
-		return nil, fmt.Errorf("key request HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("key request: %w", newHTTPStatusError(resp.StatusCode, ki.URI))
 	}
 	keyData := resp.Bytes()
 	if len(keyData) != 16 {
@@ -259,21 +291,11 @@ func stripBeforeSyncByte(data []byte) []byte {
 
 // ============================== 分片校验 ==============================
 
-// validateFmp4Segment 校验 fMP4 分片的 ISOBMFF box 链完整性。
-// 遍历所有 box，检查每个 box 是否在文件范围内，用于检测截断或损坏。
-// 返回 nil 表示 box 链完整、所有 box 均不超出文件边界。
-func validateFmp4Segment(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open: %w", err)
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	fileSize := fi.Size()
+// validateFmp4Data 校验 fMP4 分片内存数据的 ISOBMFF box 链完整性。
+// 遍历所有 box，检查每个 box 是否在数据范围内，用于检测截断或损坏。
+// 返回 nil 表示 box 链完整、所有 box 均不超出数据边界。
+func validateFmp4Data(data []byte) error {
+	fileSize := int64(len(data))
 	if fileSize < 8 {
 		return fmt.Errorf("file too small: %d bytes", fileSize)
 	}
@@ -289,24 +311,18 @@ func validateFmp4Segment(path string) error {
 	offset := int64(0)
 
 	for i := 0; i < maxBoxes; i++ {
-		// 刚好到达文件末尾 → box 链完整
+		// 刚好到达末尾 → box 链完整
 		if offset >= fileSize {
 			return nil
 		}
-		// 剩余不足 8 字节 → 文件中间截断
+		// 剩余不足 8 字节 → 数据中间截断
 		if offset+8 > fileSize {
 			return fmt.Errorf("box #%d @ offset %d: incomplete header, only %d bytes remain (truncated mid-box)",
 				i, offset, fileSize-offset)
 		}
 
-		f.Seek(offset, io.SeekStart)
-		header := make([]byte, 8)
-		if _, err := io.ReadFull(f, header); err != nil {
-			return fmt.Errorf("box #%d @ offset %d: %w", i, offset, err)
-		}
-
-		size := binary.BigEndian.Uint32(header[0:4])
-		boxType := string(header[4:8])
+		size := binary.BigEndian.Uint32(data[offset : offset+4])
+		boxType := string(data[offset+4 : offset+8])
 
 		// 第一个 box 类型必须合法
 		if i == 0 && !validTypes[boxType] {
@@ -324,14 +340,10 @@ func validateFmp4Segment(path string) error {
 			if offset+16 > fileSize {
 				return fmt.Errorf("box #%d @ offset %d: extended-size header truncated", i, offset)
 			}
-			ext := make([]byte, 8)
-			if _, err := io.ReadFull(f, ext); err != nil {
-				return fmt.Errorf("box #%d @ offset %d: %w", i, offset, err)
-			}
-			effectiveSize = int64(binary.BigEndian.Uint64(ext))
+			effectiveSize = int64(binary.BigEndian.Uint64(data[offset+8 : offset+16]))
 		}
 
-		// 检查 box 是否超出文件范围
+		// 检查 box 是否超出数据范围
 		nextOffset := offset + effectiveSize
 		if nextOffset > fileSize {
 			return fmt.Errorf("box #%d @ offset %d type=%q: declares %d bytes but only %d remain (truncated)",
@@ -342,4 +354,13 @@ func validateFmp4Segment(path string) error {
 	}
 
 	return fmt.Errorf("too many boxes (>%d), likely corrupted", maxBoxes)
+}
+
+// validateFmp4Segment 读取磁盘上的 fMP4 分片并校验其 box 链完整性。
+func validateFmp4Segment(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	return validateFmp4Data(data)
 }

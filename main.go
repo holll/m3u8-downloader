@@ -28,14 +28,14 @@ import (
 )
 
 func main() {
+	// 配置文件必须在 app.Run() 之前加载，这样 urfave/cli 解析 flag 时能读到环境变量
+	loadConfigFromArgs()
+
 	app := &cli.App{
 		Name:  "m3u8-downloader",
 		Usage: "多线程下载直播流 m3u8 视频（支持 TS/fMP4、AES-128 解密、aria2 RPC）",
 		Flags: globalFlags(),
 		Action: func(c *cli.Context) error {
-			// 配置文件用于填写 Server 模式参数（如 rpc-listen-port 等）
-			loadConfig(c.String("conf-path"))
-
 			if c.Int("rpc-listen-port") != 0 {
 				runServer(c)
 			} else {
@@ -59,21 +59,21 @@ func main() {
 func globalFlags() []cli.Flag {
 	return []cli.Flag{
 		// CLI 模式
-		&cli.StringFlag{Name: "u", Usage: "m3u8 下载地址", EnvVars: []string{"M3U8_URL"}},
-		&cli.IntFlag{Name: "n", Value: 3, Usage: "下载线程数"},
-		&cli.StringFlag{Name: "ht", Value: "v1", Usage: "host 拼接策略: v1/v2"},
-		&cli.StringFlag{Name: "o", Value: "movie", Usage: "输出文件名（不含扩展名）"},
-		&cli.StringFlag{Name: "c", Usage: "自定义请求 Cookie"},
-		&cli.BoolFlag{Name: "r", Value: true, Usage: "完成后自动清除临时 ts 文件"},
-		&cli.IntFlag{Name: "s", Value: 0, Usage: "跳过 HTTPS 证书校验（1=跳过）"},
-		&cli.StringFlag{Name: "sp", Usage: "文件保存路径（绝对路径）"},
-		&cli.IntFlag{Name: "max-retry", Value: 5, Usage: "单分片最大重试次数"},
+		&cli.StringFlag{Name: "u", Usage: "m3u8 下载地址", EnvVars: []string{"M3U8_U"}},
+		&cli.IntFlag{Name: "n", Value: task.DefaultMaxWorkers, Usage: "下载线程数", EnvVars: []string{"M3U8_N"}},
+		&cli.StringFlag{Name: "ht", Value: "v1", Usage: "host 拼接策略: v1/v2", EnvVars: []string{"M3U8_HT"}},
+		&cli.StringFlag{Name: "o", Value: "movie", Usage: "输出文件名（不含扩展名）", EnvVars: []string{"M3U8_O"}},
+		&cli.StringFlag{Name: "c", Usage: "自定义请求 Cookie", EnvVars: []string{"M3U8_C"}},
+		&cli.BoolFlag{Name: "r", Value: true, Usage: "完成后自动清除临时 ts 文件", EnvVars: []string{"M3U8_R"}},
+		&cli.IntFlag{Name: "s", Value: 0, Usage: "跳过 HTTPS 证书校验（1=跳过）", EnvVars: []string{"M3U8_S"}},
+		&cli.StringFlag{Name: "sp", Usage: "文件保存路径（绝对路径）", EnvVars: []string{"M3U8_SP"}},
+		&cli.IntFlag{Name: "max-retry", Value: 5, Usage: "单分片最大重试次数", EnvVars: []string{"M3U8_MAX_RETRY"}},
 		// RPC Server 模式
-		&cli.IntFlag{Name: "rpc-listen-port", Value: 0, Usage: "RPC 监听端口（0=CLI模式）"},
-		&cli.StringFlag{Name: "rpc-secret", Usage: "RPC 鉴权密钥"},
-		&cli.BoolFlag{Name: "rpc-listen-all", Usage: "监听所有网卡（默认仅 127.0.0.1）"},
-		&cli.IntFlag{Name: "max-concurrent-downloads", Value: 1, Usage: "最大同时下载任务数"},
-		&cli.StringFlag{Name: "session-file", Value: "m3u8.session", Usage: "会话文件路径"},
+		&cli.IntFlag{Name: "rpc-listen-port", Value: 0, Usage: "RPC 监听端口（0=CLI模式）", EnvVars: []string{"M3U8_RPC_LISTEN_PORT"}},
+		&cli.StringFlag{Name: "rpc-secret", Usage: "RPC 鉴权密钥", EnvVars: []string{"M3U8_RPC_SECRET"}},
+		&cli.BoolFlag{Name: "rpc-listen-all", Usage: "监听所有网卡（默认仅 127.0.0.1）", EnvVars: []string{"M3U8_RPC_LISTEN_ALL"}},
+		&cli.IntFlag{Name: "max-concurrent-downloads", Value: 1, Usage: "最大同时下载任务数", EnvVars: []string{"M3U8_MAX_CONCURRENT_DOWNLOADS"}},
+		&cli.StringFlag{Name: "session-file", Value: "m3u8.session", Usage: "会话文件路径", EnvVars: []string{"M3U8_SESSION_FILE"}},
 		&cli.StringFlag{Name: "conf-path", Usage: "配置文件路径（key=value 格式，用于配置 Server 模式参数）"},
 	}
 }
@@ -92,7 +92,7 @@ func spriteCommand() *cli.Command {
 			&cli.IntFlag{Name: "height", Value: 270, Usage: "缩略图高度 px"},
 			&cli.StringFlag{Name: "o", Value: "sprite", Usage: "输出文件名前缀"},
 			&cli.StringFlag{Name: "sp", Usage: "输出目录（默认当前目录）"},
-			&cli.IntFlag{Name: "n", Value: 3, Usage: "下载线程数"},
+			&cli.IntFlag{Name: "n", Value: task.DefaultMaxWorkers, Usage: "下载线程数"},
 			&cli.StringFlag{Name: "ht", Value: "v1", Usage: "hostType: v1/v2"},
 			&cli.StringFlag{Name: "c", Usage: "自定义请求 Cookie"},
 			&cli.IntFlag{Name: "s", Value: 0, Usage: "跳过 TLS 验证（1=跳过）"},
@@ -125,7 +125,11 @@ func spriteCommand() *cli.Command {
 
 // ============================== 配置文件加载 ==============================
 
-func loadConfig(cfgPath string) {
+// loadConfigFromArgs 在 app.Run() 前从 os.Args 提取 --conf-path，
+// 加载配置文件并设置环境变量，使 urfave/cli 通过 EnvVars 读取配置值。
+// 优先级：CLI 参数 > 环境变量（配置文件） > 默认值。
+func loadConfigFromArgs() {
+	cfgPath := peekArg(os.Args[1:], "conf-path")
 	if cfgPath == "" {
 		return
 	}
@@ -134,12 +138,41 @@ func loadConfig(cfgPath string) {
 		log.Printf("[config] 加载失败: %v", err)
 		return
 	}
-	// 将配置文件中的值设置为环境变量，urfave/cli 会通过 EnvVars 读取
-	// 对于没有 EnvVars 的 flag，通过 os.Args 注入不现实，保持兼容即可
 	for k, v := range cfg {
-		os.Setenv("M3U8_"+strings.ToUpper(strings.ReplaceAll(k, "-", "_")), v)
+		envKey := "M3U8_" + strings.ToUpper(strings.ReplaceAll(k, "-", "_"))
+		os.Setenv(envKey, v)
 	}
+
+	// proxy= 配置项：转换为标准的 HTTP_PROXY / HTTPS_PROXY 环境变量，
+	// dl 的 Transport 通过 ProxyFromEnvironment 读取，故对 CLI 与 RPC 模式
+	// （含 RPC 动态创建的任务）同时生效，无需逐个任务传递。
+	// 在 app.Run() 之前设置，早于任何请求发生，不受 once 缓存影响。
+	if proxy := cfg["proxy"]; proxy != "" {
+		os.Setenv("HTTP_PROXY", proxy)
+		os.Setenv("HTTPS_PROXY", proxy)
+		log.Printf("[config] 代理已启用: %s", proxy)
+	}
+
 	log.Printf("[config] 已从 %s 加载 %d 条配置", cfgPath, len(cfg))
+}
+
+// peekArg 从参数列表中提取指定 flag 的值（支持 --key=value 和 --key value 两种格式）。
+func peekArg(args []string, name string) string {
+	for i, a := range args {
+		if after, ok := strings.CutPrefix(a, "--"+name+"="); ok {
+			return after
+		}
+		if a == "--"+name && i+1 < len(args) {
+			return args[i+1]
+		}
+		if after, ok := strings.CutPrefix(a, "-"+name+"="); ok {
+			return after
+		}
+		if a == "-"+name && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 // ============================== CLI 模式 ==============================

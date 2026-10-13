@@ -76,12 +76,18 @@ type TaskStatus struct {
 	ErrorMessage    string     `json:"errorMessage,omitempty"`
 	Dir             string     `json:"dir"`
 	Files           []FileInfo `json:"files"`
-	Bittorrent      struct{}   `json:"bittorrent"`
-	InfoHash        string     `json:"infoHash"`
-	NumPieces       string     `json:"numPieces"`
-	PieceLength     string     `json:"pieceLength"`
-	FollowedBy      []string   `json:"followedBy"`
-	BelongsTo       string     `json:"belongsTo"`
+	// Bitfield 分片完成位图（每个十六进制字符 4 个分片，高位在前），
+	// AriaNg 依此渲染任务详情页的分片进度；缺失时其分片视图恒为 0/N。
+	Bitfield string `json:"bitfield,omitempty"`
+	// Bittorrent 仅对 BT 任务输出。普通 m3u8 任务保持 nil（omitempty 省略），
+	// 避免 AriaNg 因收到 {"bittorrent":{}}（JS 中为空对象也为 truthy）误判为 BT 下载
+	// 而去调用 aria2.getPeers。
+	Bittorrent  interface{} `json:"bittorrent,omitempty"`
+	InfoHash    string      `json:"infoHash"`
+	NumPieces   string      `json:"numPieces"`
+	PieceLength string      `json:"pieceLength"`
+	FollowedBy  []string    `json:"followedBy"`
+	BelongsTo   string      `json:"belongsTo"`
 }
 
 // GlobalStat aria2.getGlobalStat 返回
@@ -103,6 +109,19 @@ type VersionInfo struct {
 // SessionInfo aria2.getSessionInfo 返回
 type SessionInfo struct {
 	ID string `json:"sessionId"`
+}
+
+// ServersFileInfo aria2.getServers 返回：单文件条目
+type ServersFileInfo struct {
+	Index   string       `json:"index"`
+	Servers []ServerInfo `json:"servers"`
+}
+
+// ServerInfo 当前连接的下载服务器信息
+type ServerInfo struct {
+	URI           string `json:"uri"`
+	CurrentURI    string `json:"currentUri"`
+	DownloadSpeed string `json:"downloadSpeed"`
 }
 
 // 辅助：int64 转 aria2 字符串格式
@@ -146,6 +165,37 @@ type Options struct {
 	Header     string `json:"header,omitempty"` // 暂未使用
 	MaxWorkers int    `json:"max-connection-per-server,omitempty"`
 	MaxRetry   int    `json:"max-retry,omitempty"` // 分片重试次数（0 = 取默认值 5）
+	Pause      bool   `json:"pause,omitempty"`     // 入队即暂停（不自动开始）
+}
+
+// OptionsFromMap 将 aria2 addUri 的 options 对象转换为 Options。
+// 类型需宽容：AriaNg 重试时会把 getOption 的返回值原样回传，数值型选项是字符串
+// （如 "max-connection-per-server":"16"），而新建任务时同一选项可能是数字。
+func OptionsFromMap(m map[string]interface{}, defaultWorkers int) Options {
+	opts := Options{MaxWorkers: defaultWorkers}
+	if s, ok := m["dir"].(string); ok {
+		opts.Dir = s
+	}
+	if s, ok := m["out"].(string); ok {
+		opts.Out = s
+	}
+	if s, ok := m["cookie"].(string); ok {
+		opts.Cookie = s
+	}
+	if s, ok := m["header"].(string); ok {
+		opts.Header = s
+	}
+	if n := toInt(m["max-connection-per-server"]); n > 0 {
+		opts.MaxWorkers = n
+	}
+	if n := toInt(m["split"]); n > 0 {
+		opts.MaxWorkers = n
+	}
+	if n := toInt(m["max-retry"]); n > 0 {
+		opts.MaxRetry = n
+	}
+	opts.Pause = toBool(m["pause"])
+	return opts
 }
 
 // ============================== 会话持久化 ==============================
@@ -192,6 +242,20 @@ func toInt(v interface{}) int {
 		return n
 	default:
 		return 0
+	}
+}
+
+// toBool 从 interface{} 提取 bool。
+// aria2 的布尔选项在 JSON 中可以是 bool，AriaNg 构造 addUri 时则会写成字符串 "true"。
+func toBool(v interface{}) bool {
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		b, _ := strconv.ParseBool(val)
+		return b
+	default:
+		return false
 	}
 }
 

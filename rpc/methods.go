@@ -41,6 +41,14 @@ func init() {
 		"aria2.changeOption":         handleChangeOption,
 		"aria2.getUris":              handleGetUris,
 		"aria2.getFiles":             handleGetFiles,
+		"aria2.changePosition":       handleChangePosition,
+		"aria2.changeUri":            handleChangeUri,
+		"aria2.getServers":           handleGetServers,
+		"aria2.getPeers":             handleGetPeers,
+		"aria2.forcePauseAll":        handlePauseAll,
+		"aria2.forceShutdown":        handleShutdown,
+		"aria2.saveSession":          handleSaveSession,
+		"system.listNotifications":   handleListNotifications,
 	}
 }
 
@@ -64,9 +72,14 @@ func handleAddURI(params json.RawMessage, mgr *task.Manager) (interface{}, error
 		return nil, errParams
 	}
 
+	// options 中数值型选项需同时接受数字与数字字符串：AriaNg 重试时直接回传
+	// getOption 的结果，而 getOption 按 aria2 规范返回字符串。
 	opts := task.Options{MaxWorkers: mgr.DefaultWorkers()}
 	if len(arr) >= 2 {
-		json.Unmarshal(arr[1], &opts)
+		var m map[string]interface{}
+		if err := json.Unmarshal(arr[1], &m); err == nil && m != nil {
+			opts = task.OptionsFromMap(m, mgr.DefaultWorkers())
+		}
 	}
 
 	// 仅使用第一个 URL
@@ -188,11 +201,12 @@ func handleGetGlobalStat(params json.RawMessage, mgr *task.Manager) (interface{}
 // ============================== aria2.getVersion ==============================
 
 func handleGetVersion(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	// enabledFeatures 必须如实声明：本程序不内置 BT/Metalink 引擎，
+	// 告知 AriaNg 后其会自动隐藏种子上传等不支持的入口。
 	return task.VersionInfo{
-		Version: "m3u8-downloader/1.0",
+		Version: "1.37.0-m3u8-downloader",
 		Features: []string{
 			"Async DNS",
-			"BitTorrent",
 		},
 	}, nil
 }
@@ -211,20 +225,44 @@ type multicallReq struct {
 	Params     []json.RawMessage `json:"params"`
 }
 
+// multicallFault 构造 multicall 中单个子调用的失败项。
+// 对应 aria2 RpcMethod::createErrorResponse：JSON-RPC 模式下为 {"code","message"} 对象，
+// 且不像成功项那样再包一层数组。
+func multicallFault(code int, message string) map[string]interface{} {
+	return map[string]interface{}{"code": code, "message": message}
+}
+
+// handleMulticall 处理 system.multicall。
+// aria2 报文规范（见 RpcMethodImpl.cc 的 SystemMulticallRpcMethod::execute，
+// 其用 checkRequiredParam<List>(req, 0) 取调用列表）：
+//   - params 为 [[{methodName,params}, ...]]，外层数组仅作包裹，调用列表是 params[0]；
+//   - 成功项为 [value]（单元素数组），失败项为 {"code","message"} 对象。
+//
+// AriaNg 的重试功能依赖该格式（aria2TaskService.retryTask 取 response.data[i][0]）。
 func handleMulticall(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
-	// params 格式: [ [{methodName:"...", params:[...]}, ...] ]
-	// 先提取内层数组
-	var wrapper []multicallReq
-	if err := json.Unmarshal(params, &wrapper); err != nil {
+	var outer []json.RawMessage
+	if err := json.Unmarshal(params, &outer); err != nil || len(outer) == 0 {
 		return nil, errParams
 	}
 
-	results := make([]interface{}, 0, len(wrapper))
-	for _, call := range wrapper {
+	var calls []multicallReq
+	if err := json.Unmarshal(outer[0], &calls); err != nil {
+		// 兼容未包外层的 [{methodName,params}, ...] 写法
+		if err := json.Unmarshal(params, &calls); err != nil {
+			return nil, errParams
+		}
+	}
+
+	results := make([]interface{}, 0, len(calls))
+	for _, call := range calls {
 		h, ok := methodTable[call.MethodName]
 		if !ok {
-			// aria2 规范：multicall 错误返回 [faultCode, faultString]
-			results = append(results, []interface{}{1, "Method not found: " + call.MethodName})
+			results = append(results, multicallFault(1, "Method not found: "+call.MethodName))
+			continue
+		}
+		// aria2 禁止递归 multicall
+		if call.MethodName == "system.multicall" {
+			results = append(results, multicallFault(1, "Recursive system.multicall forbidden."))
 			continue
 		}
 		// 将 params 数组重新序列化为 json.RawMessage
@@ -235,14 +273,14 @@ func handleMulticall(params json.RawMessage, mgr *task.Manager) (interface{}, er
 		result, err := h(paramsRaw, mgr)
 		if err != nil {
 			if rpcErr, ok := err.(*RPCError); ok {
-				results = append(results, []interface{}{rpcErr.Code, rpcErr.Message})
+				results = append(results, multicallFault(rpcErr.Code, rpcErr.Message))
 			} else {
-				results = append(results, []interface{}{1, err.Error()})
+				results = append(results, multicallFault(1, err.Error()))
 			}
 			continue
 		}
-		// 成功：直接返回结果值（aria2 规范）
-		results = append(results, result)
+		// 成功：包成单元素数组（aria2 规范）
+		results = append(results, []interface{}{result})
 	}
 	return results, nil
 }
@@ -340,4 +378,114 @@ func handlePauseAll(params json.RawMessage, mgr *task.Manager) (interface{}, err
 func handleUnpauseAll(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
 	mgr.UnpauseAll()
 	return "OK", nil
+}
+
+// ============================== aria2.changePosition ==============================
+
+// handleChangePosition 调整任务在等待队列中的位置。
+// params: [gid, pos, how]，pos 为整数（可为负），how ∈ POS_SET/POS_CUR/POS_END。
+func handleChangePosition(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 3 {
+		return nil, errParams
+	}
+	var gid, how string
+	var pos int
+	if err := json.Unmarshal(arr[0], &gid); err != nil {
+		return nil, errParams
+	}
+	if err := json.Unmarshal(arr[1], &pos); err != nil {
+		return nil, errParams
+	}
+	if err := json.Unmarshal(arr[2], &how); err != nil {
+		return nil, errParams
+	}
+	newPos, err := mgr.ChangePosition(gid, pos, how)
+	if err != nil {
+		return nil, &RPCError{Code: 1, Message: err.Error()}
+	}
+	return newPos, nil
+}
+
+// ============================== aria2.changeUri ==============================
+
+// handleChangeUri 增减任务关联的 URI。
+// params: [gid, fileIndex, delUris, addUris, position(可选)]。
+func handleChangeUri(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(params, &arr); err != nil || len(arr) < 4 {
+		return nil, errParams
+	}
+	var gid string
+	var fileIndex int
+	var delUris, addUris []string
+	if err := json.Unmarshal(arr[0], &gid); err != nil {
+		return nil, errParams
+	}
+	if err := json.Unmarshal(arr[1], &fileIndex); err != nil {
+		return nil, errParams
+	}
+	if err := json.Unmarshal(arr[2], &delUris); err != nil {
+		return nil, errParams
+	}
+	if err := json.Unmarshal(arr[3], &addUris); err != nil {
+		return nil, errParams
+	}
+	del, add, err := mgr.ChangeUri(gid, fileIndex, delUris, addUris)
+	if err != nil {
+		return nil, &RPCError{Code: 1, Message: err.Error()}
+	}
+	return []int{del, add}, nil
+}
+
+// ============================== aria2.getServers ==============================
+
+// handleGetServers 返回任务各文件的服务器连接信息（仅 active 状态）。
+func handleGetServers(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var gid string
+	if err := parseParams(params, &gid); err != nil {
+		return nil, err
+	}
+	servers, err := mgr.GetServers(gid)
+	if err != nil {
+		return nil, &RPCError{Code: 1, Message: err.Error()}
+	}
+	return servers, nil
+}
+
+// ============================== aria2.getPeers ==============================
+
+// handleGetPeers 返回任务 peer 列表（m3u8 任务非 BT，任务存在即返回空数组）。
+func handleGetPeers(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	var gid string
+	if err := parseParams(params, &gid); err != nil {
+		return nil, err
+	}
+	peers, err := mgr.GetPeers(gid)
+	if err != nil {
+		return nil, &RPCError{Code: 1, Message: err.Error()}
+	}
+	return peers, nil
+}
+
+// ============================== aria2.saveSession ==============================
+
+// handleSaveSession 将会话立即写入 session-file。
+func handleSaveSession(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	if err := mgr.SaveSessionNow(); err != nil {
+		return nil, &RPCError{Code: 1, Message: err.Error()}
+	}
+	return "OK", nil
+}
+
+// ============================== system.listNotifications ==============================
+
+func handleListNotifications(params json.RawMessage, mgr *task.Manager) (interface{}, error) {
+	return []string{
+		"aria2.onDownloadStart",
+		"aria2.onDownloadPause",
+		"aria2.onDownloadStop",
+		"aria2.onDownloadComplete",
+		"aria2.onDownloadError",
+	}, nil
 }
